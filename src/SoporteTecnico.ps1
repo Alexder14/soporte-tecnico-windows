@@ -16,7 +16,7 @@ $Script:FuncionesIniciales = @(Get-ChildItem -Path function: | ForEach-Object { 
 $Script:ModoInterfaz = 'Grafica'
 if ($Consola) { $Script:ModoInterfaz = 'Consola' }
 
-$Script:Version = '2.1'
+$Script:Version = '2.2'
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -67,7 +67,57 @@ if (-not (Test-EsAdmin)) {
 
 #region ==================== CONFIGURACIÓN Y LOG ====================
 
-$Script:Base        = Join-Path $env:SystemDrive 'SoporteTecnico'
+$Script:BaseLocal   = Join-Path $env:SystemDrive 'SoporteTecnico'
+$Script:Base        = $Script:BaseLocal
+$Script:EnUsb       = $false
+$Script:AvisoUsb    = ''
+
+function Get-CarpetaPrograma {
+    # Carpeta donde está la herramienta: la del .exe o, si se usa el .ps1, la del proyecto.
+    if ($PSCommandPath) {
+        $dir = Split-Path -Parent $PSCommandPath
+        if ((Split-Path -Leaf $dir) -ieq 'src') { $dir = Split-Path -Parent $dir }
+        return $dir
+    }
+    try { return (Split-Path -Parent (Get-Process -Id $PID).Path) } catch { return $null }
+}
+
+function Test-UnidadUsb {
+    # True si la ruta está en una memoria USB o un disco externo USB.
+    param([string]$Ruta)
+    try {
+        $letra = ([System.IO.Path]::GetPathRoot($Ruta)).TrimEnd('\')
+        if ($letra -notmatch '^[A-Za-z]:$' -or $letra -ieq $env:SystemDrive) { return $false }
+        $disco = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $letra) -ErrorAction Stop
+        if ($disco.DriveType -eq 2) { return $true }
+        $bus = (Get-Partition -DriveLetter $letra.Substring(0, 1) -ErrorAction Stop | Get-Disk -ErrorAction Stop).BusType
+        return ("$bus" -eq 'USB')
+    }
+    catch { return $false }
+}
+
+# Si la herramienta se abre desde una USB, los logs, reportes y respaldos se guardan en la USB:
+#   <USB>\Clientes\<NOMBRE-DEL-EQUIPO>\Logs  y  \Reportes
+# Si la USB está protegida o llena, se usa C:\SoporteTecnico como siempre.
+$carpetaPrograma = Get-CarpetaPrograma
+if ($carpetaPrograma -and (Test-UnidadUsb $carpetaPrograma)) {
+    $baseUsb = Join-Path (Join-Path $carpetaPrograma 'Clientes') $env:COMPUTERNAME
+    try {
+        $letraUsb = ([System.IO.Path]::GetPathRoot($carpetaPrograma)).TrimEnd('\')
+        $libre = (Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $letraUsb) -ErrorAction Stop).FreeSpace
+        if ($libre -and $libre -lt 100MB) { throw ('quedan solo {0} MB libres' -f [math]::Round($libre / 1MB)) }
+        if (-not (Test-Path -LiteralPath $baseUsb)) { New-Item -ItemType Directory -Path $baseUsb -Force -ErrorAction Stop | Out-Null }
+        $prueba = Join-Path $baseUsb ('.prueba_{0}' -f [guid]::NewGuid().ToString('N'))
+        [System.IO.File]::WriteAllText($prueba, 'ok')
+        Remove-Item -LiteralPath $prueba -Force -ErrorAction SilentlyContinue
+        $Script:Base = $baseUsb
+        $Script:EnUsb = $true
+    }
+    catch {
+        $Script:AvisoUsb = 'No se pudo guardar en la USB ({0}); los logs y reportes quedan en {1}.' -f $_.Exception.Message, $Script:BaseLocal
+    }
+}
+
 $Script:DirLogs     = Join-Path $Script:Base 'Logs'
 $Script:DirReportes = Join-Path $Script:Base 'Reportes'
 $Script:LogFile     = Join-Path $Script:DirLogs ('log_{0}.txt' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
@@ -79,6 +129,7 @@ $Sync = [hashtable]::Synchronized(@{})
 $Sync.Cola = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
 $Sync.Pregunta = $null
 $Sync.Respuesta = $null
+$Sync.Cancelado = $false
 $Sync.Ocupado = $false
 $Sync.HiloUI = -1
 $Sync.Diagnostico = $null
@@ -3356,7 +3407,7 @@ function Iniciar-ExploradorUsuario {
 function Invoke-ScriptComoUsuario {
     # Guarda un script y lo ejecuta oculto en la sesión del usuario (sin permisos de administrador).
     param([string]$Contenido, [string]$Nombre = 'tarea')
-    $dir = Join-Path $Script:Base 'Temp'
+    $dir = Join-Path $Script:BaseLocal 'Temp'
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $archivo = Join-Path $dir ('{0}_{1}.ps1' -f $Nombre, (Get-Date -Format 'yyyyMMddHHmmss'))
     [System.IO.File]::WriteAllText($archivo, $Contenido, (New-Object System.Text.UTF8Encoding($true)))
@@ -4085,6 +4136,9 @@ function Get-EstadoDrivers {
     if ($malos.Count -eq 0) {
         $r.Lineas.Add('Todos los dispositivos tienen driver y funcionan.')
     }
+    $sinDriver = New-Object System.Collections.Generic.List[string]
+    $conError = New-Object System.Collections.Generic.List[string]
+    $fabricantesSinDriver = New-Object System.Collections.Generic.List[string]
     foreach ($d in $malos) {
         $codigo = [int]$d.ConfigManagerErrorCode
         $id = Get-IdentificacionHardware $d
@@ -4093,17 +4147,38 @@ function Get-EstadoDrivers {
         $r.Lineas.Add(("{0} [{1}] - {2}" -f $nombre, $d.Class, (Get-DescripcionCodigoPnp $codigo)))
         $r.Lineas.Add(("   Es: {0} | {1}" -f $id.Texto, $id.Id))
         if ($codigo -eq 28 -or $codigo -eq 1 -or $codigo -eq 18) {
-            $r.Problemas.Add((Nuevo-Problema -Texto ("'{0}' no tiene driver. Es: {1}." -f $nombre, $id.Texto) -Sugerencia ("Drivers > ""Buscar drivers en Windows Update""; si no aparece, descargar el driver de {0} o de la página del fabricante del equipo." -f $id.Fabricante) -Critica -Accion 'DRVWU'))
+            $sinDriver.Add(("'{0}' ({1})" -f $nombre, $id.Texto))
+            if ($id.Fabricante -and -not $fabricantesSinDriver.Contains("$($id.Fabricante)")) { $fabricantesSinDriver.Add("$($id.Fabricante)") }
         }
         elseif ($codigo -eq 22) {
             $r.Problemas.Add((Nuevo-Problema -Texto ("'{0}' está deshabilitado." -f $nombre) -Sugerencia 'Habilitarlo en el Administrador de dispositivos si se necesita.' -Info))
         }
-        elseif ($codigo -eq 45 -or $codigo -eq 24) {
-            $r.Lineas.Add('   (desconectado o no presente: normal si se desenchufó)')
+        elseif ($codigo -eq 45) {
+            $r.Lineas.Add('   (desconectado: normal si se desenchufó)')
+        }
+        elseif ($codigo -eq 24) {
+            # Conectado pero Windows no lo puede usar: suele faltar un driver o estar dañado
+            $r.Problemas.Add((Nuevo-Problema -Texto ("'{0}' no funciona bien o le faltan drivers (código 24). Es: {1}." -f $nombre, $id.Texto) -Sugerencia 'Drivers > "Reinstalar un dispositivo"; si sigue, "Buscar drivers en Windows Update".' -Accion 'DRVWU'))
         }
         else {
-            $r.Problemas.Add((Nuevo-Problema -Texto ("'{0}' tiene un error: {1}." -f $nombre, (Get-DescripcionCodigoPnp $codigo)) -Sugerencia 'Drivers > "Reinstalar un dispositivo"; si empezó después de una actualización, "Revertir el driver".' -Critica))
+            $conError.Add(("'{0}' ({1})" -f $nombre, (Get-DescripcionCodigoPnp $codigo)))
         }
+    }
+    # Un solo problema por tipo, para que varios dispositivos no lleven el puntaje a 0
+    if ($sinDriver.Count -eq 1) {
+        $origen = 'la página del fabricante del equipo'
+        if ($fabricantesSinDriver.Count -gt 0) { $origen = '{0} o de la página del fabricante del equipo' -f $fabricantesSinDriver[0] }
+        $r.Problemas.Add((Nuevo-Problema -Texto ("{0} no tiene driver." -f $sinDriver[0]) -Sugerencia ("Drivers > ""Buscar drivers en Windows Update""; si no aparece, descargar el driver de {0}." -f $origen) -Critica -Accion 'DRVWU'))
+    }
+    elseif ($sinDriver.Count -gt 1) {
+        $origen = 'la página del fabricante del equipo'
+        if ($fabricantesSinDriver.Count -gt 0) { $origen = '{0} o de la página del fabricante del equipo' -f ($fabricantesSinDriver -join ', ') }
+        $r.Problemas.Add((Nuevo-Problema -Texto ("{0} dispositivos no tienen driver: {1}." -f $sinDriver.Count, ($sinDriver -join '; ')) -Sugerencia ("Drivers > ""Buscar drivers en Windows Update""; lo que no aparezca, descargarlo de {0}." -f $origen) -Critica -Accion 'DRVWU'))
+    }
+    if ($conError.Count -gt 0) {
+        $texto = "Dispositivo con error: {0}." -f $conError[0]
+        if ($conError.Count -gt 1) { $texto = "{0} dispositivos con error: {1}." -f $conError.Count, ($conError -join '; ') }
+        $r.Problemas.Add((Nuevo-Problema -Texto $texto -Sugerencia 'Drivers > "Reinstalar un dispositivo"; si empezó después de una actualización, "Revertir el driver".' -Critica))
     }
 
     # 2. Drivers sin firma y drivers que no cargaron
@@ -4154,6 +4229,14 @@ function Get-EstadoDrivers {
 #endregion
 
 #region ==================== DRIVERS: ACCIONES ====================
+
+function ConvertTo-VersionDriver {
+    # Convierte "31.0.101.4502" en [version] para comparar bien (como texto, "9.0" quedaría por encima de "10.0").
+    param($Texto)
+    $v = $null
+    if ([version]::TryParse(("$Texto".Trim()), [ref]$v)) { return $v }
+    return $null
+}
 
 function Test-CodigoPnputil {
     # pnputil: 0 = correcto, 3010 = correcto pero requiere reiniciar
@@ -4277,10 +4360,18 @@ function Respaldar-Drivers {
     Write-Host '    Copia todos los drivers de fabricantes instalados (no los de Microsoft, que vienen con Windows).' -ForegroundColor DarkGray
     Write-Host '    Úselo antes de formatear: después se restauran con "Restaurar o instalar drivers desde carpeta/USB".' -ForegroundColor DarkGray
     $predeterminada = Join-Path $Script:Base ('Drivers_{0}_{1}' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd'))
-    $resp = Read-Host ("  Carpeta de destino, por ejemplo E:\ para una USB (Enter = {0})" -f $predeterminada)
+    $nombreCarpeta = 'Drivers_{0}_{1}' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd')
+    $resp = Read-Host ("  Carpeta de destino, por ejemplo E:\ para una USB (vacío = {0})" -f $predeterminada)
+    # En la ventana, "Cancelar" no debe iniciar el respaldo en la carpeta predeterminada
+    if ($Script:ModoInterfaz -eq 'Grafica' -and $Sync.Cancelado) { Write-Log 'Operación cancelada.' 'INFO'; return $false }
     $destino = "$resp".Trim().Trim('"')
     if (-not $destino) { $destino = $predeterminada }
-    elseif ($destino -match '^[A-Za-z]:\\?$') { $destino = Join-Path $destino.Substring(0, 2) ('Drivers_{0}_{1}' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd')) }
+    elseif ($destino -match '^[A-Za-z]:\\?$') { $destino = Join-Path $destino.Substring(0, 2) $nombreCarpeta }
+    else { $destino = $destino.TrimEnd('\') }
+    # Si la carpeta ya tiene archivos, se usa una subcarpeta nueva para no mezclar con respaldos viejos
+    if ((Test-Path -LiteralPath $destino) -and @(Get-ChildItem -LiteralPath $destino -Force -ErrorAction SilentlyContinue).Count -gt 0) {
+        $destino = Join-Path $destino ('{0}_{1}' -f $nombreCarpeta, (Get-Date -Format 'HHmmss'))
+    }
     try {
         if (-not (Test-Path -LiteralPath $destino)) { New-Item -ItemType Directory -Path $destino -Force -ErrorAction Stop | Out-Null }
     }
@@ -4300,7 +4391,7 @@ function Respaldar-Drivers {
         $inventario = Join-Path $destino 'inventario_drivers.csv'
         Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop |
             Where-Object { $_.InfName -like 'oem*.inf' } |
-            Select-Object DeviceName, DeviceClass, DriverProviderName, DriverVersion, @{ n = 'DriverDate'; e = { if ($_.DriverDate) { ([datetime]$_.DriverDate).ToString('yyyy-MM-dd') } } }, InfName, HardWareID |
+            Select-Object DeviceName, DeviceClass, DriverProviderName, DriverVersion, @{ n = 'DriverDate'; e = { if ($_.DriverDate) { ([datetime]$_.DriverDate).ToString('yyyy-MM-dd') } } }, InfName, @{ n = 'HardWareID'; e = { @($_.HardWareID) -join '; ' } } |
             Export-Csv -LiteralPath $inventario -NoTypeInformation -Encoding UTF8
         $leeme = @(
             "Respaldo de drivers de $env:COMPUTERNAME - $(Get-Date -Format 'dd/MM/yyyy HH:mm')",
@@ -4313,8 +4404,12 @@ function Respaldar-Drivers {
     }
     catch { }
     $tamano = [math]::Round((Get-TamanoCarpeta $destino) / 1MB)
+    if (-not (Test-CodigoPnputil $codigo)) {
+        Write-Log ("Respaldo INCOMPLETO: pnputil terminó con código {0}. Se copiaron {1} drivers ({2} MB) en {3}, pero pueden faltar otros. No formatee confiando en este respaldo." -f $codigo, $infs.Count, $tamano, $destino) 'ERROR'
+        return $false
+    }
     Write-Log ("Respaldo listo: {0} drivers ({1} MB) en {2}" -f $infs.Count, $tamano, $destino) 'OK'
-    return (Test-CodigoPnputil $codigo) -or ($infs.Count -gt 0)
+    return $true
 }
 
 function Instalar-DriversCarpeta {
@@ -4345,6 +4440,11 @@ function Instalar-DriversCarpeta {
     Write-Log ("Dispositivos con problema: antes {0}, después {1}." -f $antes, $despues) 'INFO'
     Write-Log 'Algunos drivers se terminan de aplicar al reiniciar.' 'INFO'
     $Script:RequiereReinicio = $true
+    if ($codigo -eq 259) {
+        # 259 = los drivers quedaron en el almacén pero ningún dispositivo necesitaba actualizarse
+        Write-Log 'Los drivers se agregaron; ningún dispositivo conectado necesitaba actualizarse.' 'INFO'
+        return $true
+    }
     return ((Test-CodigoPnputil $codigo) -or $despues -lt $antes)
 }
 
@@ -4441,13 +4541,48 @@ function Revertir-Driver {
     $paquete = $almacen | Where-Object { $_.Driver -ieq $actual.InfName } | Select-Object -First 1
     if (-not $paquete) { Write-Log 'No se encontró el paquete del driver actual.' 'ERROR'; return $false }
     $original = Split-Path $paquete.OriginalFileName -Leaf
-    $anteriores = @($almacen | Where-Object { $_.Driver -ine $actual.InfName -and (Split-Path $_.OriginalFileName -Leaf) -ieq $original } | Sort-Object -Property Version -Descending)
+    $versionActual = ConvertTo-VersionDriver $paquete.Version
+    if (-not $versionActual) { $versionActual = ConvertTo-VersionDriver $actual.DriverVersion }
+    # Identificadores del dispositivo, para usar solo paquetes que de verdad le sirven
+    $idsDispositivo = @()
+    foreach ($clave in @('DEVPKEY_Device_HardwareIds', 'DEVPKEY_Device_CompatibleIds')) {
+        try { $idsDispositivo += @((Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName $clave -ErrorAction Stop).Data) } catch { }
+    }
+    $idsDispositivo = @($idsDispositivo | Where-Object { $_ } | ForEach-Object { "$_".ToUpperInvariant() })
+    $anteriores = New-Object System.Collections.Generic.List[object]
+    foreach ($c in @($almacen | Where-Object { $_.Driver -ine $actual.InfName -and (Split-Path $_.OriginalFileName -Leaf) -ieq $original })) {
+        $v = ConvertTo-VersionDriver $c.Version
+        # Solo versiones MÁS VIEJAS que la actual
+        if (-not $v -or -not $versionActual -or $v -ge $versionActual) { continue }
+        if ($idsDispositivo.Count -gt 0) {
+            $sirve = $false
+            try {
+                foreach ($h in @(Get-WindowsDriver -Online -Driver $c.Driver -ErrorAction Stop)) {
+                    if ($h.HardwareId -and $idsDispositivo -contains "$($h.HardwareId)".ToUpperInvariant()) { $sirve = $true; break }
+                }
+            }
+            catch { }
+            if (-not $sirve) { continue }
+        }
+        $anteriores.Add([pscustomobject]@{ Driver = $c.Driver; Version = $c.Version; VersionObj = $v })
+    }
+    $anteriores = @($anteriores | Sort-Object -Property VersionObj -Descending)
     if ($anteriores.Count -eq 0) {
         Write-Log 'No hay otra versión de este driver guardada en el equipo.' 'ADVERTENCIA'
         Write-Log 'Alternativas: "Reinstalar un dispositivo", "Buscar drivers en Windows Update" o el driver del fabricante.' 'INFO'
         return $false
     }
-    foreach ($a in $anteriores) { Write-Log ("Versión disponible: {0} ({1})" -f $a.Version, $a.Driver) 'INFO' }
+    foreach ($a in $anteriores) { Write-Log ("Versión anterior disponible: {0} ({1})" -f $a.Version, $a.Driver) 'INFO' }
+    # pnputil /delete-driver /force quita el paquete de TODOS los dispositivos que lo usan
+    $otros = @()
+    try {
+        $otros = @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop | Where-Object { $_.InfName -ieq $actual.InfName -and $_.DeviceID -ne $d.InstanceId -and $_.DeviceName })
+    }
+    catch { }
+    if ($otros.Count -gt 0) {
+        Write-Log ("Este mismo driver ({0}) también lo usan {1} dispositivo(s) más; se les quitará también:" -f $actual.InfName, $otros.Count) 'ADVERTENCIA'
+        foreach ($o in ($otros | Select-Object -First 10)) { Write-Host ("      - {0}" -f $o.DeviceName) -ForegroundColor Yellow }
+    }
     if (-not (Confirmar ("¿Quitar la versión {0} para que Windows use la {1}? (se crea un punto de restauración)" -f $actual.DriverVersion, $anteriores[0].Version))) { return $false }
     if ("$($d.Class)" -eq 'Net') { Mostrar-AvisoSesionRemota }
     $null = New-PuntoRestauracion
@@ -4943,9 +5078,11 @@ function Solicitar-Gui {
     # Pide una respuesta al usuario desde cualquier hilo.
     param([string]$Tipo, [string]$Texto)
     if ($Sync.HiloUI -eq [System.Threading.Thread]::CurrentThread.ManagedThreadId) {
+        $Sync.Cancelado = $false
         return [string](Mostrar-DialogoGui @{ Tipo = $Tipo; Texto = $Texto })
     }
     $Sync.Respuesta = $null
+    $Sync.Cancelado = $false
     $Sync.Pregunta = @{ Tipo = $Tipo; Texto = $Texto }
     while ($null -eq $Sync.Respuesta) { Start-Sleep -Milliseconds 150 }
     $r = [string]$Sync.Respuesta
@@ -5005,6 +5142,7 @@ function Mostrar-DialogoGui {
     $r = "$($dlg.Tag)"
     if ($tipo -eq 'Texto') {
         if ($r.StartsWith('T:')) { return $r.Substring(2) }
+        $Sync.Cancelado = $true
         return ''
     }
     if ($tipo -eq 'SiNo') {
@@ -5339,7 +5477,7 @@ function New-RunspaceGui {
         if (($Script:FuncionesIniciales -notcontains $f.Name) -or $f.Name -eq 'Clear-Host') { $funciones[$f.Name] = $f.Definition }
     }
     $variables = @{ Sync = $Sync; RequiereReinicio = $false }
-    foreach ($v in @('Version', 'Base', 'DirLogs', 'DirReportes', 'LogFile', 'NombresAcciones', 'CodigoCoreAudio', 'ClaveIteraciones', 'ModoInterfaz')) {
+    foreach ($v in @('Version', 'Base', 'BaseLocal', 'EnUsb', 'DirLogs', 'DirReportes', 'LogFile', 'NombresAcciones', 'CodigoCoreAudio', 'ClaveIteraciones', 'ModoInterfaz', 'VendoresPci', 'VendoresUsb', 'VendoresAcpi', 'TiposPci', 'TiposUsb')) {
         $variables[$v] = (Get-Variable -Name $v -Scope Script).Value
     }
     $ps = [powershell]::Create()
@@ -5374,6 +5512,8 @@ function Iniciar-InterfazGrafica {
 
     $ventana.Title = "Soporte Técnico v$($Script:Version) - $env:COMPUTERNAME"
     $Script:Gui.TxtEquipo.Text = "$env:COMPUTERNAME`n$($Script:InfoSO)"
+    if ($Script:EnUsb) { $Script:Gui.TxtEquipo.Text += "`nGuardando reportes en la USB" }
+    elseif ($Script:AvisoUsb) { $Script:Gui.TxtEquipo.Text += "`nNo se pudo usar la USB: reportes en $($Script:BaseLocal)" }
     $Script:Gui.TxtVersion.Text = "v$($Script:Version)`nLog: $($Script:LogFile)"
 
     foreach ($cat in $Script:CategoriasGui.Keys) {
@@ -5470,6 +5610,8 @@ function Mostrar-Menu {
     Write-Host ('  ' + ('=' * 60)) -ForegroundColor DarkCyan
     Write-Host ("   SOPORTE TÉCNICO v{0}   |   Equipo: {1}" -f $Script:Version, $env:COMPUTERNAME) -ForegroundColor White
     Write-Host ("   {0}" -f $Script:InfoSO) -ForegroundColor DarkGray
+    if ($Script:EnUsb) { Write-Host ("   Guardando en la USB: {0}" -f $Script:Base) -ForegroundColor DarkGray }
+    elseif ($Script:AvisoUsb) { Write-Host ("   {0}" -f $Script:AvisoUsb) -ForegroundColor Yellow }
     Write-Host ('  ' + ('=' * 60)) -ForegroundColor DarkCyan
     Write-Host ''
     Write-Host '   DIAGNÓSTICO' -ForegroundColor Cyan
@@ -5510,6 +5652,8 @@ try {
 catch { }
 
 Write-Log ("Inicio de Soporte Técnico v{0} en {1} (usuario: {2}, modo {3}). {4}" -f $Script:Version, $env:COMPUTERNAME, $env:USERNAME, $Script:ModoInterfaz, $Script:InfoSO) 'INFO' -SoloArchivo
+if ($Script:EnUsb) { Write-Log ("Ejecutando desde USB: logs y reportes en {0}" -f $Script:Base) 'INFO' -SoloArchivo }
+if ($Script:AvisoUsb) { Write-Log $Script:AvisoUsb 'ADVERTENCIA' -SoloArchivo }
 
 if ($Script:ModoInterfaz -eq 'Grafica') {
     try {

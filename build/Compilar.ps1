@@ -104,11 +104,27 @@ $consola = $comunes.Clone()
 $consola['inputFile'] = $fuenteConsola
 $consola['outputFile'] = $salidaConsola
 
-Write-Host "Compilando versión $version (interfaz gráfica)..." -ForegroundColor Cyan
-Invoke-ps2exe @grafica
-Write-Host "Compilando versión $version (consola)..." -ForegroundColor Cyan
-Invoke-ps2exe @consola
-Remove-Item -LiteralPath $fuenteConsola -Force -ErrorAction SilentlyContinue
+# Se borran los .exe anteriores: si la compilación falla, no debe quedar uno viejo que parezca nuevo
+foreach ($exe in @($salida, $salidaConsola)) {
+    if (Test-Path -LiteralPath $exe) {
+        try { Remove-Item -LiteralPath $exe -Force -ErrorAction Stop }
+        catch {
+            Write-Host "No se pudo borrar $exe (¿está abierto?). Ciérrelo y vuelva a compilar." -ForegroundColor Red
+            Remove-Item -LiteralPath $fuenteConsola -Force -ErrorAction SilentlyContinue
+            exit 1
+        }
+    }
+}
+
+try {
+    Write-Host "Compilando versión $version (interfaz gráfica)..." -ForegroundColor Cyan
+    Invoke-ps2exe @grafica
+    Write-Host "Compilando versión $version (consola)..." -ForegroundColor Cyan
+    Invoke-ps2exe @consola
+}
+finally {
+    Remove-Item -LiteralPath $fuenteConsola -Force -ErrorAction SilentlyContinue
+}
 
 $faltan = @(@($salida, $salidaConsola) | Where-Object { -not (Test-Path -LiteralPath $_) })
 if ($faltan.Count -gt 0) {

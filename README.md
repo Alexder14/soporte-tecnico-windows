@@ -1,6 +1,6 @@
-# Soporte Técnico para Windows 10/11 (v2.1)
+# Soporte Técnico para Windows 10/11 (v2.2)
 
-> **Estado: en desarrollo.** La versión 2.0 todavía no se ha probado en un equipo Windows real. Úsela primero en un equipo de prueba.
+> **Estado: en desarrollo.** La versión 2.2 todavía no se ha probado en un equipo Windows real. Úsela primero en un equipo de prueba.
 
 Herramienta portable para técnicos de soporte. Diagnostica el equipo, le pone un puntaje de salud, sugiere qué reparar y aplica las reparaciones. Todo lo que hace queda registrado en un log.
 
@@ -19,7 +19,7 @@ Las dos versiones piden permisos de administrador por sí solas y usan la misma 
 
 ## Uso (interfaz gráfica)
 
-1. Copie `SoporteTecnico.exe` al equipo del cliente, por ejemplo en una USB, y ábralo.
+1. Abra `SoporteTecnico.exe` desde su USB (no hace falta copiarlo al equipo). Los reportes se guardan en la USB.
 2. Escriba la contraseña, si hay una configurada.
 3. En **Inicio**, pulse **Diagnóstico completo**. El análisis tarda 1 o 2 minutos y muestra:
    - El puntaje de 0 a 100 y el estado: bueno, requiere atención o crítico.
@@ -115,12 +115,31 @@ Es una barrera para que el cliente o un curioso no use la herramienta. No es seg
 
 ## Dónde quedan los archivos
 
+**Si abre la herramienta desde una USB** (o un disco externo USB), todo se guarda en la USB, en una carpeta por equipo, junto al `.exe`:
+
+```
+USB\
+├── SoporteTecnico.exe
+├── SoporteTecnico-Consola.exe
+└── Clientes\
+    └── PC-CONTABILIDAD\
+        ├── Logs\                 log de cada sesión
+        ├── Reportes\             diagnósticos, batería y respaldos de configuración
+        └── Drivers_<PC>_<fecha>\ respaldo de drivers (si eligió la carpeta predeterminada)
+```
+
+Así queda el historial de cada cliente en la USB y no se deja nada en su equipo. Si la USB está protegida contra escritura o le quedan menos de 100 MB, la herramienta lo avisa y guarda en `C:\SoporteTecnico`, como cuando se abre desde el disco del equipo:
+
 | Qué | Dónde |
 |---|---|
 | Logs | `C:\SoporteTecnico\Logs\log_yyyyMMdd_HHmmss.txt`, uno por sesión |
 | Diagnósticos | `C:\SoporteTecnico\Reportes\Diagnostico_<PC>_<fecha>.txt` y `.html` |
 | Batería | `C:\SoporteTecnico\Reportes\bateria_<fecha>.html` |
 | Respaldos | `C:\SoporteTecnico\Reportes\` (hosts, proxy, identidad de Office) |
+
+Los scripts temporales que se ejecutan en la sesión del usuario siempre van a `C:\SoporteTecnico\Temp`.
+
+> Los reportes incluyen modelo, número de serie y nombre de cada equipo. Si pierde la USB, esos datos quedan expuestos: considere cifrarla con BitLocker To Go.
 
 ## Compilar
 
