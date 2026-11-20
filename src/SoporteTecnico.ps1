@@ -16,7 +16,7 @@ $Script:FuncionesIniciales = @(Get-ChildItem -Path function: | ForEach-Object { 
 $Script:ModoInterfaz = 'Grafica'
 if ($Consola) { $Script:ModoInterfaz = 'Consola' }
 
-$Script:Version = '2.4'
+$Script:Version = '2.5'
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -134,6 +134,7 @@ $Sync.Ocupado = $false
 $Sync.HiloUI = -1
 $Sync.Diagnostico = $null
 $Sync.PsActual = $null
+$Sync.ClaveExportacion = $null
 $Sync.Visita = [hashtable]::Synchronized(@{
         Activa = $false; Id = ''; Inicio = (Get-Date); Serie = ''; Diagnostico = $false
         Acciones = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
@@ -242,6 +243,7 @@ function Test-Acceso {
             finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
         }
         $hash = Get-HashClave -Clave $plano -Sal $sal -Iteraciones $Script:ClaveIteraciones
+        if ($hash -ceq $Script:ClaveHash) { try { Set-ClaveExportacion -Clave $plano } catch { } }
         $plano = $null
         if ($hash -ceq $Script:ClaveHash) {
             Write-Log ("Acceso concedido (usuario de Windows: {0})." -f $env:USERNAME) 'INFO' -SoloArchivo
@@ -4735,8 +4737,8 @@ $Script:Catalogo = @(
     @{ Cat = 'Herramientas'; Titulo = 'Servicios'; Desc = 'Servicios de Windows.'; Cmd = "Abrir-Herramienta 'services'"; Ui = $true }
     @{ Cat = 'Herramientas'; Titulo = 'Carpeta de reportes'; Desc = 'Diagnósticos, respaldos y reportes.'; Cmd = "Abrir-Herramienta 'reportes'"; Ui = $true }
     @{ Cat = 'Herramientas'; Titulo = 'Abrir el log de esta sesión'; Desc = 'Todo lo que hizo la herramienta.'; Cmd = "Abrir-Herramienta 'log'"; Ui = $true }
-    @{ Cat = 'Herramientas'; Titulo = 'Exportar esta visita'; Desc = 'Trabajo remoto: guarda la visita en un .zip para cargarlo después en su USB (se hace solo al cerrar si no está en la USB).'; Cmd = 'Exportar-Visita'; Avanzada = $true }
-    @{ Cat = 'Herramientas'; Titulo = 'Importar visitas remotas'; Desc = 'Carga en el historial de la USB los .zip de visitas hechas sin la USB.'; Cmd = 'Importar-Visitas'; Avanzada = $true }
+    @{ Cat = 'Herramientas'; Titulo = 'Exportar esta visita'; Desc = 'Trabajo remoto: guarda la visita en un archivo .stv cifrado para cargarlo después en su USB (se hace solo al cerrar si no está en la USB).'; Cmd = 'Exportar-Visita'; Avanzada = $true }
+    @{ Cat = 'Herramientas'; Titulo = 'Importar visitas remotas'; Desc = 'Carga en el historial de la USB los archivos .stv de visitas hechas sin la USB.'; Cmd = 'Importar-Visitas'; Avanzada = $true }
 )
 
 function Mostrar-Avanzadas {
@@ -5101,6 +5103,112 @@ function Test-VisitaConActividad {
 
 #endregion
 
+function Set-ClaveExportacion {
+    # Al entrar con la contraseña: deriva la clave que cifra los archivos .stv de visitas.
+    # Se guarda solo la clave derivada (nunca la contraseña) y no está dentro del .exe:
+    # sin la contraseña de la herramienta, un .stv no se puede abrir.
+    param([string]$Clave)
+    $sal = [System.Text.Encoding]::UTF8.GetBytes('SoporteTecnico.Visitas.v1|') + [Convert]::FromBase64String($Script:ClaveSal)
+    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($Clave, [byte[]]$sal, [int]$Script:ClaveIteraciones)
+    try { $Sync.ClaveExportacion = [byte[]]$kdf.GetBytes(32) }
+    finally { $kdf.Dispose() }
+}
+
+function Get-ClaveExportacion {
+    # La coma evita que PowerShell convierta el arreglo de bytes en una lista de objetos
+    if ($Sync.ClaveExportacion) { return , ([byte[]]$Sync.ClaveExportacion) }
+    # Sin contraseña configurada: clave fija. El formato sigue siendo propio, pero quien extraiga
+    # el script del .exe podría abrirlo. Configure una contraseña para que sea realmente privado.
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return , ([byte[]]$sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes('SoporteTecnico.Visitas.v1|sin-contrasena'))) }
+    finally { $sha.Dispose() }
+}
+
+function Get-SubclaveVisita {
+    # Clave distinta para cifrar y para firmar, y distinta en cada archivo (según su sal).
+    param([byte[]]$Maestra, [byte[]]$Sal, [byte]$Uso)
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new($Maestra)
+    try { return , ([byte[]]$hmac.ComputeHash([byte[]]($Sal + $Uso))) }
+    finally { $hmac.Dispose() }
+}
+
+function Get-HuellaClave {
+    # 8 bytes que identifican la clave, para avisar "se creó con otra contraseña" en vez de "archivo dañado".
+    param([byte[]]$Maestra)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return , ([byte[]]($sha.ComputeHash([byte[]]($Maestra + [System.Text.Encoding]::UTF8.GetBytes('huella')))[0..7])) }
+    finally { $sha.Dispose() }
+}
+
+# Formato .stv (Soporte Técnico - Visita):
+#   "STV1" (4) | huella de la clave (8) | sal (16) | IV (16) | datos cifrados AES-256-CBC | HMAC-SHA256 (32)
+# El HMAC cubre todo lo anterior: si el archivo se modifica o se daña, no se importa.
+
+function Protect-ArchivoVisita {
+    param([byte[]]$Datos)
+    [byte[]]$maestra = Get-ClaveExportacion
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $sal = New-Object byte[] 16
+    $rng.GetBytes($sal)
+    $rng.Dispose()
+    $aes = [System.Security.Cryptography.Aes]::Create()
+    try {
+        $aes.KeySize = 256
+        $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+        $aes.Key = [byte[]](Get-SubclaveVisita $maestra $sal 1)
+        $aes.GenerateIV()
+        $cifrador = $aes.CreateEncryptor()
+        $cifrado = $cifrador.TransformFinalBlock($Datos, 0, $Datos.Length)
+        $cifrador.Dispose()
+        # Se arma con un MemoryStream: sumar arreglos grandes en PowerShell es muy lento
+        $ms = New-Object System.IO.MemoryStream
+        foreach ($parte in @([System.Text.Encoding]::ASCII.GetBytes('STV1'), [byte[]](Get-HuellaClave $maestra), $sal, $aes.IV)) { $ms.Write($parte, 0, $parte.Length) }
+        $ms.Write($cifrado, 0, $cifrado.Length)
+    }
+    finally { $aes.Dispose() }
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new([byte[]](Get-SubclaveVisita $maestra $sal 2))
+    try { $firma = $hmac.ComputeHash($ms.ToArray()) }
+    finally { $hmac.Dispose() }
+    $ms.Write($firma, 0, $firma.Length)
+    $resultado = $ms.ToArray()
+    $ms.Dispose()
+    return , $resultado
+}
+
+function Unprotect-ArchivoVisita {
+    param([byte[]]$Datos)
+    if ($Datos.Length -lt (4 + 8 + 16 + 16 + 16 + 32) -or [System.Text.Encoding]::ASCII.GetString($Datos, 0, 4) -ne 'STV1') {
+        throw 'no es un archivo de visita de esta herramienta'
+    }
+    [byte[]]$maestra = Get-ClaveExportacion
+    $huella = [byte[]]$Datos[4..11]
+    if ([Convert]::ToBase64String($huella) -ne [Convert]::ToBase64String((Get-HuellaClave $maestra))) {
+        throw 'se creó con otra contraseña de la herramienta (o en una herramienta sin contraseña). Ábralo con la contraseña que tenía cuando se exportó'
+    }
+    $sal = [byte[]]$Datos[12..27]
+    $iv = [byte[]]$Datos[28..43]
+    $finCuerpo = $Datos.Length - 32
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new([byte[]](Get-SubclaveVisita $maestra $sal 2))
+    try { $esperada = $hmac.ComputeHash($Datos, 0, $finCuerpo) }
+    finally { $hmac.Dispose() }
+    $diferencia = 0
+    for ($i = 0; $i -lt 32; $i++) { $diferencia = $diferencia -bor ($esperada[$i] -bxor $Datos[$finCuerpo + $i]) }
+    if ($diferencia -ne 0) { throw 'el archivo está dañado o fue modificado' }
+    $aes = [System.Security.Cryptography.Aes]::Create()
+    try {
+        $aes.KeySize = 256
+        $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+        $aes.Key = [byte[]](Get-SubclaveVisita $maestra $sal 1)
+        $aes.IV = $iv
+        $descifrador = $aes.CreateDecryptor()
+        try { return , ([byte[]]$descifrador.TransformFinalBlock($Datos, 44, $finCuerpo - 44)) }
+        finally { $descifrador.Dispose() }
+    }
+    finally { $aes.Dispose() }
+}
+
 function Escribir-HistorialEquipo {
     # Genera <carpeta del equipo>\Historial.txt con todas las visitas de ese equipo.
     param($Filas, [string]$Serie, [string]$Equipo, [string]$Carpeta)
@@ -5123,7 +5231,7 @@ function Escribir-HistorialEquipo {
 }
 
 function Exportar-Visita {
-    # Para el trabajo remoto (sin la USB): empaqueta en un .zip las visitas de este equipo, su ficha,
+    # Para el trabajo remoto (sin la USB): empaqueta en un .stv cifrado las visitas de este equipo, su ficha,
     # sus programas y los logs y reportes de esta sesión. Luego se carga en la USB con "Importar visitas".
     $ruta = Get-RutaHistorialGeneral
     if (-not (Test-Path -LiteralPath $ruta)) { Write-Log 'Todavía no hay visitas que exportar.' 'INFO'; return $null }
@@ -5153,12 +5261,21 @@ function Exportar-Visita {
         }
         Set-Content -LiteralPath (Join-Path $preparacion 'equipo.txt') -Value $env:COMPUTERNAME -Encoding UTF8
 
-        $zip = Join-Path $dirExportar ('Visita_{0}_{1}.zip' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmm'))
-        if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-        [System.IO.Compression.ZipFile]::CreateFromDirectory($preparacion, $zip)
-        Write-Log ("Visita exportada: {0}" -f $zip) 'OK'
+        # Se comprime y se cifra: el .stv solo lo abre esta herramienta con su contraseña
+        $zipTemporal = "$preparacion.zip"
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($preparacion, $zipTemporal)
+        $original = [System.IO.File]::ReadAllBytes($zipTemporal)
+        $cifrado = Protect-ArchivoVisita $original
+        # Comprobación: el archivo cifrado debe poder abrirse y dar exactamente lo mismo
+        $prueba = Unprotect-ArchivoVisita $cifrado
+        if ($prueba.Length -ne $original.Length -or [Convert]::ToBase64String($prueba) -ne [Convert]::ToBase64String($original)) { throw 'la comprobación del archivo cifrado falló' }
+        Remove-Item -LiteralPath $zipTemporal -Force -ErrorAction SilentlyContinue
+        $archivo = Join-Path $dirExportar ('Visita_{0}_{1}.stv' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmm'))
+        [System.IO.File]::WriteAllBytes($archivo, $cifrado)
+        Write-Log ("Visita exportada (cifrada): {0}" -f $archivo) 'OK'
+        if (-not $Sync.ClaveExportacion) { Write-Log 'La herramienta no tiene contraseña: el archivo usa una clave fija. Configure una contraseña para que nadie más pueda abrirlo.' 'ADVERTENCIA' }
         Write-Log 'Copie ese archivo a su USB, en Clientes\Importar, o use "Importar visitas remotas".' 'INFO'
-        return $zip
+        return $archivo
     }
     catch {
         Write-Log "No se pudo exportar la visita: $($_.Exception.Message)" 'ERROR'
@@ -5166,22 +5283,25 @@ function Exportar-Visita {
     }
     finally {
         Remove-Item -LiteralPath $preparacion -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath "$preparacion.zip" -Force -ErrorAction SilentlyContinue
     }
 }
 
 function Importar-ArchivoVisita {
-    # Carga un .zip de Exportar-Visita en el historial y en la carpeta del equipo. Devuelve cuántas visitas agregó.
-    param([string]$Zip)
+    # Carga un .stv de Exportar-Visita en el historial y en la carpeta del equipo. Devuelve cuántas visitas agregó.
+    param([string]$Archivo)
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $temp = Join-Path $env:TEMP ('soporte_import_{0}' -f [guid]::NewGuid().ToString('N'))
     try {
-        [System.IO.Compression.ZipFile]::ExtractToDirectory($Zip, $temp)
+        $zipTemporal = "$temp.zip"
+        [System.IO.File]::WriteAllBytes($zipTemporal, (Unprotect-ArchivoVisita ([System.IO.File]::ReadAllBytes($Archivo))))
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($zipTemporal, $temp)
         $csv = Join-Path $temp 'visitas.csv'
         if (-not (Test-Path -LiteralPath $csv)) { throw 'no es un archivo de visita de esta herramienta (falta visitas.csv)' }
         $nuevas = @(Import-Csv -LiteralPath $csv -Encoding UTF8 -ErrorAction Stop | Where-Object { $_.Id })
         if ($nuevas.Count -eq 0) { throw 'el archivo no tiene visitas' }
 
-        # 1. Unir al historial general sin duplicar (la misma visita puede venir en varios .zip)
+        # 1. Unir al historial general sin duplicar (la misma visita puede venir en varios .stv)
         $ruta = Get-RutaHistorialGeneral
         $filas = New-Object System.Collections.Generic.List[object]
         if (Test-Path -LiteralPath $ruta) { foreach ($x in @(Import-Csv -LiteralPath $ruta -Encoding UTF8 -ErrorAction Stop)) { $filas.Add($x) } }
@@ -5216,11 +5336,12 @@ function Importar-ArchivoVisita {
             }
         }
         Escribir-HistorialEquipo -Filas $ordenadas -Serie "$($ultima.Serie)" -Equipo "$($ultima.Equipo)" -Carpeta $carpeta
-        Write-Log ("Importado {0}: {1} visita(s) nueva(s) de {2}" -f (Split-Path -Leaf $Zip), $agregadas, $ultima.Equipo) 'OK'
+        Write-Log ("Importado {0}: {1} visita(s) nueva(s) de {2}" -f (Split-Path -Leaf $Archivo), $agregadas, $ultima.Equipo) 'OK'
         return $agregadas
     }
     finally {
         Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath "$temp.zip" -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -5229,7 +5350,7 @@ function Get-DirImportar {
 }
 
 function Importar-Visitas {
-    # Carga los .zip exportados en equipos atendidos de forma remota.
+    # Carga los .stv exportados en equipos atendidos de forma remota.
     param([switch]$Automatico)
     $dirImportar = Get-DirImportar
     if (-not $Automatico) {
@@ -5237,9 +5358,9 @@ function Importar-Visitas {
         if (-not $Script:EnUsb) {
             Write-Log 'La herramienta no se abrió desde la USB: las visitas se importarán al historial de este equipo, no al de la USB.' 'ADVERTENCIA'
         }
-        Write-Host ('    Cargue aquí los archivos Visita_<equipo>_<fecha>.zip que la herramienta genera al trabajar sin la USB.') -ForegroundColor DarkGray
+        Write-Host ('    Cargue aquí los archivos Visita_<equipo>_<fecha>.stv que la herramienta genera al trabajar sin la USB.') -ForegroundColor DarkGray
         Write-Host ('    También puede dejarlos en {0}: se cargan solos al abrir la herramienta.' -f $dirImportar) -ForegroundColor DarkGray
-        $resp = Read-Host ('  Archivo .zip o carpeta con los .zip (vacío = {0})' -f $dirImportar)
+        $resp = Read-Host ('  Archivo .stv o carpeta con los .stv (vacío = {0})' -f $dirImportar)
         if ($Script:ModoInterfaz -eq 'Grafica' -and $Sync.Cancelado) { Write-Log 'Operación cancelada.' 'INFO'; return $false }
         $origen = "$resp".Trim().Trim('"')
         if (-not $origen) { $origen = $dirImportar }
@@ -5252,9 +5373,9 @@ function Importar-Visitas {
         return $false
     }
     if (Test-Path -LiteralPath $origen -PathType Leaf) { $zips = @(Get-Item -LiteralPath $origen) }
-    else { $zips = @(Get-ChildItem -LiteralPath $origen -Filter 'Visita_*.zip' -File -ErrorAction SilentlyContinue | Sort-Object -Property Name) }
+    else { $zips = @(Get-ChildItem -LiteralPath $origen -Filter 'Visita_*.stv' -File -ErrorAction SilentlyContinue | Sort-Object -Property Name) }
     if ($zips.Count -eq 0) {
-        if (-not $Automatico) { Write-Log 'No se encontraron archivos Visita_*.zip.' 'INFO' }
+        if (-not $Automatico) { Write-Log 'No se encontraron archivos Visita_*.stv.' 'INFO' }
         return $false
     }
     $total = 0
@@ -5279,7 +5400,7 @@ function Importar-Visitas {
 }
 
 function Finalizar-VisitaRemota {
-    # Al cerrar sin la USB: exporta la visita y abre la carpeta para copiar el .zip por AnyDesk/TeamViewer.
+    # Al cerrar sin la USB: exporta la visita y abre la carpeta para copiar el .stv por AnyDesk/TeamViewer.
     if ($Script:EnUsb) { return $null }
     $zip = Exportar-Visita
     if ($zip) { try { Abrir-ParaUsuario (Split-Path -Parent $zip) } catch { } }
@@ -6016,6 +6137,7 @@ function Validar-ClaveGui {
     $sal = [Convert]::FromBase64String($Script:ClaveSal)
     $hash = Get-HashClave -Clave $Script:Gui.TxtClave.Password -Sal $sal -Iteraciones $Script:ClaveIteraciones
     if ($hash -ceq $Script:ClaveHash) {
+        try { Set-ClaveExportacion -Clave $Script:Gui.TxtClave.Password } catch { }
         $Script:Gui.PanelLogin.Visibility = [System.Windows.Visibility]::Collapsed
         $Script:Gui.Principal.Visibility = [System.Windows.Visibility]::Visible
         $Script:Gui.TxtClave.Clear()

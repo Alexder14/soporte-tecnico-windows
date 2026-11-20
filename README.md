@@ -1,6 +1,6 @@
-# Soporte Técnico para Windows 10/11 (v2.4)
+# Soporte Técnico para Windows 10/11 (v2.5)
 
-> **Estado: en desarrollo.** La versión 2.4 todavía no se ha probado en un equipo Windows real. Úsela primero en un equipo de prueba.
+> **Estado: en desarrollo.** La versión 2.5 todavía no se ha probado en un equipo Windows real. Úsela primero en un equipo de prueba.
 
 Herramienta portable para técnicos de soporte. Diagnostica el equipo, le pone un puntaje de salud, sugiere qué reparar y aplica las reparaciones. Todo lo que hace queda registrado en un log.
 
@@ -111,11 +111,16 @@ Además se guarda la **ficha del equipo**. Solo datos de identificación, **nunc
 
 Cuando atiende por AnyDesk o TeamViewer, la herramienta corre en el equipo del cliente y no en su USB. Para que esas visitas también lleguen a su historial:
 
-1. **Al cerrar** la herramienta, la visita se exporta sola a `C:\SoporteTecnico\Exportar\Visita_<equipo>_<fecha>.zip` y se abre esa carpeta. El `.zip` lleva las visitas de ese equipo, su ficha, la lista de programas, el log y los reportes de la sesión. No lleva los respaldos de drivers, porque pesan demasiado.
-2. **Copie el `.zip`** a su PC con la transferencia de archivos de AnyDesk o TeamViewer.
+1. **Al cerrar** la herramienta, la visita se exporta sola a `C:\SoporteTecnico\Exportar\Visita_<equipo>_<fecha>.stv` y se abre esa carpeta. El archivo lleva las visitas de ese equipo, su ficha, la lista de programas, el log y los reportes de la sesión. No lleva los respaldos de drivers, porque pesan demasiado.
+2. **Copie el `.stv`** a su PC con la transferencia de archivos de AnyDesk o TeamViewer.
 3. **Póngalo en la USB**, en `Clientes\Importar\`. La próxima vez que abra la herramienta desde la USB, se carga sola en el historial y en la carpeta del equipo. Los ya cargados se mueven a `Clientes\Importar\Importados\`.
 
-También puede usar **Herramientas > Importar visitas remotas** para cargar un `.zip` o una carpeta en cualquier momento, y **Herramientas > Exportar esta visita** para generar el `.zip` sin cerrar. La misma visita no se duplica aunque la importe dos veces.
+También puede usar **Herramientas > Importar visitas remotas** para cargar un `.stv` o una carpeta en cualquier momento, y **Herramientas > Exportar esta visita** para generar el `.stv` sin cerrar. La misma visita no se duplica aunque la importe dos veces.
+
+**El `.stv` es un formato propio y cifrado.** No se abre con WinRAR, 7-Zip ni ningún otro programa, y si alguien lo modifica la herramienta no lo importa.
+- Se cifra con AES-256 usando una clave que sale de **la contraseña de la herramienta**. Esa clave no está guardada en el `.exe`: sin la contraseña no se puede abrir, ni siquiera extrayendo el script.
+- Si **cambia la contraseña**, los `.stv` hechos con la anterior ya no se pueden importar. Importe los pendientes antes de cambiarla.
+- Si la herramienta **no tiene contraseña**, el `.stv` usa una clave fija: el cliente no lo puede abrir, pero alguien que extraiga el script del `.exe` sí. Configure una contraseña.
 
 En el equipo del cliente, el historial de sus propias visitas queda en `C:\SoporteTecnico\Historial.csv`. Si el `Historial.csv` está abierto en Excel, no se puede actualizar: ciérrelo antes de terminar la visita.
 
