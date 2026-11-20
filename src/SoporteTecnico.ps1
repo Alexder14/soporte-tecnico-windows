@@ -16,7 +16,7 @@ $Script:FuncionesIniciales = @(Get-ChildItem -Path function: | ForEach-Object { 
 $Script:ModoInterfaz = 'Grafica'
 if ($Consola) { $Script:ModoInterfaz = 'Consola' }
 
-$Script:Version = '2.5'
+$Script:Version = '2.6'
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -135,6 +135,7 @@ $Sync.HiloUI = -1
 $Sync.Diagnostico = $null
 $Sync.PsActual = $null
 $Sync.ClaveExportacion = $null
+$Sync.SinArchivosLocales = $false
 $Sync.Visita = [hashtable]::Synchronized(@{
         Activa = $false; Id = ''; Inicio = (Get-Date); Serie = ''; Diagnostico = $false
         Acciones = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
@@ -189,6 +190,8 @@ function Write-Log {
     if (-not $SoloArchivo) {
         Write-Host ("  [{0}] {1}" -f $Nivel, $Mensaje) -ForegroundColor $color
     }
+    # Sin la USB, al cerrar se borra el log del equipo del cliente: desde ahí ya no se escribe en disco
+    if ($Sync.SinArchivosLocales) { return }
     $linea = '[{0}] [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Nivel, $Mensaje
     # La ventana y las tareas en segundo plano escriben al mismo archivo: reintentar si está ocupado
     for ($intento = 1; $intento -le 3; $intento++) {
@@ -5000,6 +5003,7 @@ function Guardar-FichaEquipo {
     catch { }
     $Sync.Visita.Ficha = [pscustomobject]$f
     if (Test-SerieValida $fab.Serie) { $Sync.Visita.Serie = $fab.Serie }
+    if ($Sync.SinArchivosLocales) { return $true }
 
     try {
         $programas = @(Get-ProgramasInstalados $perfil)
@@ -5030,7 +5034,7 @@ function Guardar-Visita {
     # Reescribe la fila de esta visita en el historial general y regenera el historial del equipo.
     # Nunca detiene la herramienta: si falla (USB llena, archivo abierto en Excel), solo lo avisa en el log.
     $v = $Sync.Visita
-    if (-not $v.Activa) { return }
+    if (-not $v.Activa -or $Sync.SinArchivosLocales) { return }
     if ($v.Acciones.Count -eq 0 -and -not $v.Diagnostico) { return }
     [System.Threading.Monitor]::Enter($v)
     try {
@@ -5255,8 +5259,11 @@ function Exportar-Visita {
         foreach ($f in @(Get-ChildItem -LiteralPath $Script:Base -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'Ficha_equipo.txt' -or $_.Name -like 'Programas_*.csv' })) {
             Copy-Item -LiteralPath $f.FullName -Destination $dirEquipo -Force
         }
-        if (Test-Path -LiteralPath $Script:LogFile) { Copy-Item -LiteralPath $Script:LogFile -Destination (Join-Path $dirEquipo 'Logs') -Force }
-        foreach ($f in @(Get-ChildItem -LiteralPath $Script:DirReportes -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $desde -and $_.Length -lt 50MB })) {
+        # Sin la USB se llevan todos (también los de una sesión que se cerró de golpe), porque al cerrar se borran
+        $logs = @(Get-Item -LiteralPath $Script:LogFile -ErrorAction SilentlyContinue)
+        if (-not $Script:EnUsb) { $logs = @(Get-ChildItem -LiteralPath $Script:DirLogs -File -ErrorAction SilentlyContinue) }
+        foreach ($f in $logs) { Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $dirEquipo 'Logs') -Force }
+        foreach ($f in @(Get-ChildItem -LiteralPath $Script:DirReportes -File -ErrorAction SilentlyContinue | Where-Object { ((-not $Script:EnUsb) -or $_.LastWriteTime -ge $desde) -and $_.Length -lt 50MB })) {
             Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $dirEquipo 'Reportes') -Force
         }
         Set-Content -LiteralPath (Join-Path $preparacion 'equipo.txt') -Value $env:COMPUTERNAME -Encoding UTF8
@@ -5399,12 +5406,91 @@ function Importar-Visitas {
     return ($fallos -eq 0)
 }
 
+function Get-RutaHistorialLocalCifrado {
+    return (Join-Path $Script:BaseLocal 'Historial.stv')
+}
+
+function Abrir-HistorialLocal {
+    # Sin la USB: el historial de este equipo se guarda cifrado (Historial.stv). Al entrar se descifra
+    # para usarlo durante la sesión, y al cerrar se vuelve a cifrar y se borra la copia legible.
+    if ($Script:EnUsb) { return }
+    $cifrado = Get-RutaHistorialLocalCifrado
+    if (-not (Test-Path -LiteralPath $cifrado)) { return }
+    # Si quedó el .csv de una sesión que se cerró de golpe, ese es el más nuevo
+    if (Test-Path -LiteralPath (Get-RutaHistorialGeneral)) { return }
+    try {
+        [System.IO.File]::WriteAllBytes((Get-RutaHistorialGeneral), (Unprotect-ArchivoVisita ([System.IO.File]::ReadAllBytes($cifrado))))
+    }
+    catch {
+        Write-Log ("No se pudo abrir el historial guardado en este equipo ({0}). Se empieza uno nuevo; el anterior se conserva aparte." -f $_.Exception.Message) 'ADVERTENCIA' -SoloArchivo
+        try { Move-Item -LiteralPath $cifrado -Destination ($cifrado -replace '\.stv$', ('_anterior_{0}.stv' -f (Get-Date -Format 'yyyyMMddHHmmss'))) -Force } catch { }
+    }
+}
+
+function Limpiar-RastrosLocales {
+    # Sin la USB, al cerrar: cifra el historial del equipo y borra todo lo legible que dejó la herramienta
+    # (historial, ficha, programas, logs, reportes y temporales). Se conservan los .stv (cifrados) y los
+    # respaldos de drivers, que son del cliente y pueden hacer falta.
+    param([bool]$ExportacionOk = $true)
+    if ($Script:EnUsb) { return $false }
+    $csv = Get-RutaHistorialGeneral
+    try {
+        if (Test-Path -LiteralPath $csv) {
+            $datos = [System.IO.File]::ReadAllBytes($csv)
+            $cifrado = Protect-ArchivoVisita $datos
+            $prueba = Unprotect-ArchivoVisita $cifrado
+            if ([Convert]::ToBase64String($prueba) -ne [Convert]::ToBase64String($datos)) { throw 'la comprobación del historial cifrado falló' }
+            $destino = Get-RutaHistorialLocalCifrado
+            [System.IO.File]::WriteAllBytes("$destino.tmp", $cifrado)
+            Move-Item -LiteralPath "$destino.tmp" -Destination $destino -Force -ErrorAction Stop
+        }
+    }
+    catch {
+        Write-Log ("No se pudo cifrar el historial de este equipo ({0}): no se borra nada para no perderlo." -f $_.Exception.Message) 'ERROR'
+        return $false
+    }
+    if (-not $ExportacionOk) {
+        Write-Log 'La visita no se pudo exportar: los logs y reportes se dejan en este equipo para no perderlos.' 'ADVERTENCIA'
+        return $false
+    }
+    $Sync.SinArchivosLocales = $true
+    $borrar = New-Object System.Collections.Generic.List[string]
+    foreach ($n in @('Historial.csv', 'Historial.csv.tmp', 'Historial.txt', 'Ficha_equipo.txt')) { $borrar.Add((Join-Path $Script:BaseLocal $n)) }
+    foreach ($f in @(Get-ChildItem -LiteralPath $Script:BaseLocal -Filter 'Programas_*.csv' -File -ErrorAction SilentlyContinue)) { $borrar.Add($f.FullName) }
+    foreach ($dir in @($Script:DirLogs, $Script:DirReportes, (Join-Path $Script:BaseLocal 'Temp'))) {
+        if (Test-Path -LiteralPath $dir) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $dir -Recurse -File -Force -ErrorAction SilentlyContinue)) { $borrar.Add($f.FullName) }
+        }
+    }
+    $fallaron = New-Object System.Collections.Generic.List[string]
+    foreach ($f in $borrar) {
+        if (Test-Path -LiteralPath $f) {
+            try { Remove-Item -LiteralPath $f -Force -ErrorAction Stop } catch { $fallaron.Add((Split-Path -Leaf $f)) }
+        }
+    }
+    if ($fallaron.Count -gt 0) {
+        Write-Host ("  No se pudieron borrar (en uso): {0}" -f ($fallaron -join ', ')) -ForegroundColor Yellow
+        return $false
+    }
+    return $true
+}
+
 function Finalizar-VisitaRemota {
-    # Al cerrar sin la USB: exporta la visita y abre la carpeta para copiar el .stv por AnyDesk/TeamViewer.
+    # Al cerrar sin la USB: exporta la visita a un .stv, borra lo legible y abre la carpeta del .stv
+    # para copiarlo por AnyDesk/TeamViewer. Devuelve la ruta del .stv (o $null).
+    param([bool]$Exportar = $true)
     if ($Script:EnUsb) { return $null }
-    $zip = Exportar-Visita
-    if ($zip) { try { Abrir-ParaUsuario (Split-Path -Parent $zip) } catch { } }
-    return $zip
+    $archivo = $null
+    $ok = $true
+    if ($Exportar) {
+        $archivo = Exportar-Visita
+        $ok = [bool]$archivo
+    }
+    if (Limpiar-RastrosLocales -ExportacionOk $ok) {
+        Write-Host '  No quedó información legible de la herramienta en este equipo.' -ForegroundColor Green
+    }
+    if ($archivo) { try { Abrir-ParaUsuario (Split-Path -Parent $archivo) } catch { } }
+    return $archivo
 }
 
 function Invoke-Registrada {
@@ -5426,6 +5512,7 @@ function Iniciar-VisitaGui {
     # Después de entrar: avisa si el equipo ya se atendió antes y recopila su ficha en segundo plano.
     $Script:Gui.AccesoOk = $true
     if ($Script:EnUsb) { try { $null = Importar-Visitas -Automatico } catch { } }
+    try { Abrir-HistorialLocal } catch { }
     try { Iniciar-Visita } catch { }
     if ($Sync.Visita.AvisoAnterior) { Write-Host ('HISTORIAL: ' + $Sync.Visita.AvisoAnterior) -ForegroundColor Yellow }
     # La ficha se arma en segundo plano, en un runspace propio, para no bloquear los botones
@@ -6268,8 +6355,13 @@ function Iniciar-InterfazGrafica {
                     Cerrar-Visita -Cliente $cliente -Notas $notas
                     $zip = Finalizar-VisitaRemota
                     if ($zip) {
-                        [void](Mostrar-DialogoGui @{ Tipo = 'Info'; Titulo = 'Visita exportada'; Texto = ("No está trabajando desde la USB, así que la visita se guardó en:`n{0}`n`nCópielo a su USB, en la carpeta Clientes\Importar (por ejemplo con la transferencia de archivos de AnyDesk). Se carga solo la próxima vez que abra la herramienta desde la USB." -f $zip) })
+                        $limpio = ''
+                        if ($Script:Sync.SinArchivosLocales) { $limpio = "`n`nNo quedó información legible de la herramienta en este equipo." }
+                        [void](Mostrar-DialogoGui @{ Tipo = 'Info'; Titulo = 'Visita exportada'; Texto = ("No está trabajando desde la USB, así que la visita se guardó cifrada en:`n{0}`n`nCópielo a su USB, en la carpeta Clientes\Importar (por ejemplo con la transferencia de archivos de AnyDesk). Se carga solo la próxima vez que abra la herramienta desde la USB.{1}" -f $zip, $limpio) })
                     }
+                }
+                else {
+                    $null = Finalizar-VisitaRemota -Exportar $false
                 }
             }
             catch { Write-Log ("No se pudo cerrar la visita: {0}" -f $_.Exception.Message) 'ADVERTENCIA' -SoloArchivo }
@@ -6393,6 +6485,7 @@ if ($Script:ModoInterfaz -eq 'Grafica') {
 if (-not (Test-Acceso)) { exit }
 
 if ($Script:EnUsb) { try { $null = Importar-Visitas -Automatico } catch { } }
+try { Abrir-HistorialLocal } catch { }
 try { Iniciar-Visita } catch { }
 Write-Host '  Recopilando los datos del equipo...' -ForegroundColor DarkGray
 try { $null = Guardar-FichaEquipo } catch { Write-Log "No se pudo recopilar la ficha del equipo: $($_.Exception.Message)" 'ADVERTENCIA' -SoloArchivo }
@@ -6456,10 +6549,15 @@ if (Test-VisitaConActividad) {
         Read-Host '  Presione Enter para salir'
     }
 }
+else {
+    try { $null = Finalizar-VisitaRemota -Exportar $false } catch { }
+}
 Write-Log 'Fin de la sesión de Soporte Técnico.' 'INFO' -SoloArchivo
 Write-Host ''
-Write-Host "  Log guardado en: $($Script:LogFile)" -ForegroundColor Cyan
-Write-Host "  Reportes en:     $($Script:DirReportes)" -ForegroundColor Cyan
+if (-not $Sync.SinArchivosLocales) {
+    Write-Host "  Log guardado en: $($Script:LogFile)" -ForegroundColor Cyan
+    Write-Host "  Reportes en:     $($Script:DirReportes)" -ForegroundColor Cyan
+}
 Start-Sleep -Seconds 2
 
 #endregion

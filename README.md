@@ -1,6 +1,6 @@
-# Soporte Técnico para Windows 10/11 (v2.5)
+# Soporte Técnico para Windows 10/11 (v2.6)
 
-> **Estado: en desarrollo.** La versión 2.5 todavía no se ha probado en un equipo Windows real. Úsela primero en un equipo de prueba.
+> **Estado: en desarrollo.** La versión 2.6 todavía no se ha probado en un equipo Windows real. Úsela primero en un equipo de prueba.
 
 Herramienta portable para técnicos de soporte. Diagnostica el equipo, le pone un puntaje de salud, sugiere qué reparar y aplica las reparaciones. Todo lo que hace queda registrado en un log.
 
@@ -122,7 +122,16 @@ También puede usar **Herramientas > Importar visitas remotas** para cargar un `
 - Si **cambia la contraseña**, los `.stv` hechos con la anterior ya no se pueden importar. Importe los pendientes antes de cambiarla.
 - Si la herramienta **no tiene contraseña**, el `.stv` usa una clave fija: el cliente no lo puede abrir, pero alguien que extraiga el script del `.exe` sí. Configure una contraseña.
 
-En el equipo del cliente, el historial de sus propias visitas queda en `C:\SoporteTecnico\Historial.csv`. Si el `Historial.csv` está abierto en Excel, no se puede actualizar: ciérrelo antes de terminar la visita.
+**No queda nada legible en el equipo del cliente.** Al cerrar la herramienta sin la USB:
+- se borran el historial, la ficha, la lista de programas, los logs, los reportes (incluidos los respaldos de hosts, proxy e identidad de Office) y los temporales. Todo eso viaja antes dentro del `.stv`, así que no se pierde;
+- el historial de ese equipo queda **cifrado** en `C:\SoporteTecnico\Historial.stv`. Así, la próxima vez que lo atienda en remoto, la herramienta igual le avisa de las visitas anteriores;
+- solo quedan los `.stv` de `C:\SoporteTecnico\Exportar`, que están cifrados, y los **respaldos de drivers**, que son del cliente y pueden hacer falta.
+
+Ojo con estos casos:
+- **Durante la sesión** los archivos sí están legibles, porque la herramienta los usa. Se borran al cerrar.
+- **Si la herramienta se cierra de golpe** (se cuelga, se cierra la consola con la X o se apaga el equipo), los archivos quedan hasta la próxima vez que la abra y la cierre bien en ese equipo.
+- **Si la exportación falla**, no se borra nada para no perder la visita, y se avisa.
+- Si alguien falla la contraseña 3 veces, queda solo el log con los intentos fallidos. Si el `Historial.csv` está abierto en Excel, no se puede actualizar: ciérrelo antes de terminar la visita.
 
 ## Usuario del cliente y usuario administrador
 
