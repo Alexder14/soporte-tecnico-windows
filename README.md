@@ -1,6 +1,6 @@
-# Soporte Técnico para Windows 10/11 (v2.2)
+# Soporte Técnico para Windows 10/11 (v2.3)
 
-> **Estado: en desarrollo.** La versión 2.2 todavía no se ha probado en un equipo Windows real. Úsela primero en un equipo de prueba.
+> **Estado: en desarrollo.** La versión 2.3 todavía no se ha probado en un equipo Windows real. Úsela primero en un equipo de prueba.
 
 Herramienta portable para técnicos de soporte. Diagnostica el equipo, le pone un puntaje de salud, sugiere qué reparar y aplica las reparaciones. Todo lo que hace queda registrado en un log.
 
@@ -82,6 +82,32 @@ En la versión de consola, estas reparaciones nuevas (incluidas las de drivers) 
 4. Para lo que siga sin driver: **Buscar drivers en Windows Update** y luego **Página de drivers del fabricante**.
 
 **Revertir el driver** solo funciona si la versión anterior sigue guardada en Windows. Si no, la herramienta lo avisa y propone las alternativas. Antes de revertir crea un punto de restauración.
+
+## Historial de visitas
+
+Cada vez que abre la herramienta en un equipo queda registrada la **visita**: qué equipo es, de quién es, qué se hizo y cómo quedó.
+
+- **Al entrar**, si ya atendió ese equipo, se lo avisa: cuántas veces, la fecha de la última visita, qué se hizo y las notas. El equipo se reconoce por el **número de serie**, así que lo encuentra aunque le hayan cambiado el nombre o lo hayan formateado. Si la serie es de relleno (PCs armadas y máquinas virtuales), se usa el nombre del equipo.
+- **Durante la visita** se anota cada tarea y si salió bien, con avisos, con error o si se interrumpió, más el puntaje del primer y del último diagnóstico. El historial se guarda después de cada tarea, así que no se pierde si se va la luz o se desconecta la USB.
+- **Al cerrar** se piden dos datos opcionales: el nombre del cliente (se rellena con el de la visita anterior) y notas, por ejemplo qué problema tenía.
+
+Además se guarda la **ficha del equipo**. Solo datos de identificación, **nunca contraseñas**:
+- usuario de Windows, su nombre y la cuenta Microsoft o de empresa con la que inicia sesión;
+- cuentas de Office;
+- dominio o grupo de trabajo;
+- marca, modelo, número de serie y versión de Windows;
+- **ID de AnyDesk y de TeamViewer**, para conectarse la próxima vez;
+- procesador, RAM y discos;
+- lista de programas instalados.
+
+| Archivo | Qué tiene |
+|---|---|
+| `Clientes\Historial.csv` | Todas las visitas a todos los equipos. Se abre en Excel |
+| `Clientes\<equipo>\Historial.txt` | Las visitas de ese equipo, fáciles de leer |
+| `Clientes\<equipo>\Ficha_equipo.txt` | Ficha del equipo de la última visita |
+| `Clientes\<equipo>\Programas_<fecha>.csv` | Programas instalados ese día (útil antes de formatear) |
+
+Si la herramienta no corre desde una USB, el historial queda en `C:\SoporteTecnico\Historial.csv`. Si el `Historial.csv` está abierto en Excel, no se puede actualizar: ciérrelo antes de terminar la visita.
 
 ## Usuario del cliente y usuario administrador
 

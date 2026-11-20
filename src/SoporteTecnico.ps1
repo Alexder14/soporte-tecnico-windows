@@ -16,7 +16,7 @@ $Script:FuncionesIniciales = @(Get-ChildItem -Path function: | ForEach-Object { 
 $Script:ModoInterfaz = 'Grafica'
 if ($Consola) { $Script:ModoInterfaz = 'Consola' }
 
-$Script:Version = '2.2'
+$Script:Version = '2.3'
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -134,6 +134,12 @@ $Sync.Ocupado = $false
 $Sync.HiloUI = -1
 $Sync.Diagnostico = $null
 $Sync.PsActual = $null
+$Sync.Visita = [hashtable]::Synchronized(@{
+        Activa = $false; Id = ''; Inicio = (Get-Date); Serie = ''; Diagnostico = $false
+        Acciones = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+        PuntajeAntes = $null; PuntajeDespues = $null; TareaActual = ''; Cliente = ''; Notas = ''
+        Ficha = $null; AvisoAnterior = ''; ClienteAnterior = ''
+    })
 
 if ($Script:ModoInterfaz -eq 'Grafica') {
     function Write-Host {
@@ -1142,6 +1148,7 @@ function Invoke-Diagnostico {
         return $false
     }
 
+    Registrar-PuntajeVisita
     $archivoHtml = [System.IO.Path]::ChangeExtension($archivo, '.html')
     try {
         New-ReporteHtml -Ruta $archivoHtml -Fecha $fecha
@@ -2610,14 +2617,14 @@ function Reparar-Outlook {
         $hizoAlgo = $true
         try {
             switch ($op) {
-                '1' { $null = Limpiar-CacheOutlook }
-                '2' { $null = Abrir-OutlookModoSeguro }
-                '3' { $null = Reparar-InicioSesionOffice }
-                '4' { $null = Reconstruir-Ost }
-                '5' { $null = Reparar-Office -Tipo 'QuickRepair' }
-                '6' { $null = Reparar-Office -Tipo 'FullRepair' }
-                '7' { $null = Restablecer-PanelOutlook }
-                '8' { $null = Abrir-PerfilesCorreo }
+                '1' { Invoke-Registrada 'Outlook: limpiar caché' { Limpiar-CacheOutlook } }
+                '2' { Invoke-Registrada 'Outlook: abrir en modo seguro' { Abrir-OutlookModoSeguro } }
+                '3' { Invoke-Registrada 'Outlook: reparar inicio de sesión de Office' { Reparar-InicioSesionOffice } }
+                '4' { Invoke-Registrada 'Outlook: reconstruir OST' { Reconstruir-Ost } }
+                '5' { Invoke-Registrada 'Reparar Office (rápida)' { Reparar-Office -Tipo 'QuickRepair' } }
+                '6' { Invoke-Registrada 'Reparar Office (en línea)' { Reparar-Office -Tipo 'FullRepair' } }
+                '7' { Invoke-Registrada 'Outlook: restablecer panel de carpetas' { Restablecer-PanelOutlook } }
+                '8' { Invoke-Registrada 'Outlook: abrir perfiles de correo' { Abrir-PerfilesCorreo } }
                 '0' { $volver = $true; $hizoAlgo = $false }
                 ''  { $hizoAlgo = $false }
                 default { Write-Host '  Opción no válida.' -ForegroundColor Red; $hizoAlgo = $false; Start-Sleep -Seconds 1 }
@@ -2856,10 +2863,12 @@ function Invoke-ReparacionAutomatica {
         if ($r.Ok) {
             Write-Host ("    [OK]    {0}" -f $r.Paso) -ForegroundColor Green
             Write-Log ("Resumen automático: {0} -> OK" -f $r.Paso) 'OK' -SoloArchivo
+            try { Registrar-AccionVisita ('Automática: ' + $r.Paso) 'OK' } catch { }
         }
         else {
             Write-Host ("    [FALLÓ] {0}" -f $r.Paso) -ForegroundColor Red
             Write-Log ("Resumen automático: {0} -> FALLÓ o cancelado" -f $r.Paso) 'ERROR' -SoloArchivo
+            try { Registrar-AccionVisita ('Automática: ' + $r.Paso) 'Avisos' } catch { }
         }
     }
     Write-Host ''
@@ -4760,6 +4769,365 @@ function Mostrar-Avanzadas {
 
 #endregion
 
+#region ==================== HISTORIAL DE VISITAS Y FICHA DEL EQUIPO ====================
+# Cada vez que se abre la herramienta se registra una "visita": qué equipo, de quién es,
+# qué se hizo y cómo quedó el puntaje. Solo datos de identificación: NUNCA contraseñas.
+# El estado vive en $Sync.Visita porque en la ventana las tareas corren en otro hilo.
+
+function Get-RutaHistorialGeneral {
+    # USB: <USB>\Clientes\Historial.csv | Local: C:\SoporteTecnico\Historial.csv
+    if ($Script:EnUsb) { return (Join-Path (Split-Path -Parent $Script:Base) 'Historial.csv') }
+    return (Join-Path $Script:BaseLocal 'Historial.csv')
+}
+
+function Test-SerieValida {
+    # Las PCs armadas y las máquinas virtuales traen series de relleno que no identifican nada.
+    param([string]$Serie)
+    $s = "$Serie".Trim()
+    if ($s.Length -lt 4) { return $false }
+    if ($s -match '^(0+|1234567890?|[xX]+)$') { return $false }
+    if ($s -match 'O\.?E\.?M|Default string|System Serial|Serial Number|To Be Filled|Not Specified|None|Chassis|VMware|VirtualBox|Parallels|^QEMU') { return $false }
+    return $true
+}
+
+function Iniciar-Visita {
+    # Prepara la visita actual y busca visitas anteriores a este equipo.
+    $v = $Sync.Visita
+    $v.Activa = $true
+    $v.Id = '{0}_{1}' -f (Get-Date -Format 'yyyyMMdd_HHmmss'), $env:COMPUTERNAME
+    $v.Inicio = Get-Date
+    $serie = ''
+    try { $serie = "$((Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SerialNumber)".Trim() } catch { }
+    $v.Serie = $serie
+    $v.AvisoAnterior = ''
+    $v.ClienteAnterior = ''
+    $ruta = Get-RutaHistorialGeneral
+    if (-not (Test-Path -LiteralPath $ruta)) { return }
+    try {
+        $serieValida = Test-SerieValida $serie
+        $anteriores = @(Import-Csv -LiteralPath $ruta -Encoding UTF8 -ErrorAction Stop | Where-Object {
+                ($serieValida -and $_.Serie -eq $serie) -or ($_.Equipo -eq $env:COMPUTERNAME)
+            })
+        if ($anteriores.Count -eq 0) { return }
+        $ultima = $anteriores[$anteriores.Count - 1]
+        $v.ClienteAnterior = "$($ultima.Cliente)"
+        $texto = 'Ya atendió este equipo {0} vez/veces. Última visita: {1}' -f $anteriores.Count, $ultima.Fecha
+        if ($ultima.Cliente) { $texto += (' (cliente: {0})' -f $ultima.Cliente) }
+        if ($ultima.Equipo -and $ultima.Equipo -ne $env:COMPUTERNAME) { $texto += (', antes se llamaba {0}' -f $ultima.Equipo) }
+        $texto += '.'
+        if ($ultima.Acciones) { $texto += (' Se hizo: {0}.' -f $ultima.Acciones) }
+        if ($ultima.Notas) { $texto += (' Notas: {0}' -f $ultima.Notas) }
+        $v.AvisoAnterior = $texto
+    }
+    catch {
+        Write-Log "No se pudo leer el historial de visitas: $($_.Exception.Message)" 'ADVERTENCIA' -SoloArchivo
+    }
+}
+
+function Registrar-AccionVisita {
+    # Anota una tarea en la visita y guarda el historial enseguida (por si se va la luz o se saca la USB).
+    param([string]$Titulo, [ValidateSet('OK', 'Avisos', 'Error', 'Interrumpida')][string]$Estado)
+    $v = $Sync.Visita
+    if (-not $v.Activa) { return }
+    # 'Reparar lo encontrado' se anota paso por paso dentro de Invoke-ReparacionAutomatica
+    if ($Titulo -eq 'Datos del equipo') { return }
+    if ($Titulo -eq 'Reparar lo encontrado' -and $Estado -ne 'Interrumpida' -and $Estado -ne 'Error') { return }
+    if ($Titulo -eq 'Diagnóstico completo') { $v.Diagnostico = $true }
+    else {
+        $etiqueta = @{ 'OK' = 'OK'; 'Avisos' = 'con avisos o cancelado'; 'Error' = 'ERROR'; 'Interrumpida' = 'interrumpida' }[$Estado]
+        [void]$v.Acciones.Add(('{0} ({1})' -f $Titulo, $etiqueta))
+    }
+    Guardar-Visita
+}
+
+function Registrar-PuntajeVisita {
+    # Se llama al terminar cada diagnóstico: guarda el primer y el último puntaje de la visita.
+    try {
+        $p = (Get-PuntajeSalud).Puntaje
+        if ($null -eq $Sync.Visita.PuntajeAntes) { $Sync.Visita.PuntajeAntes = $p }
+        $Sync.Visita.PuntajeDespues = $p
+    }
+    catch { }
+}
+
+function Get-IdAnyDesk {
+    # AnyDesk instalado guarda su ID en ProgramData; el portable, en el AppData del usuario.
+    param($Perfil)
+    $archivos = New-Object System.Collections.Generic.List[string]
+    foreach ($dir in @((Join-Path $env:ProgramData 'AnyDesk'), (Join-Path $Perfil.Ruta 'AppData\Roaming\AnyDesk'))) {
+        if (Test-Path -LiteralPath $dir) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter 'system.conf' -Recurse -File -ErrorAction SilentlyContinue)) { $archivos.Add($f.FullName) }
+        }
+    }
+    $ids = New-Object System.Collections.Generic.List[string]
+    foreach ($a in $archivos) {
+        try {
+            foreach ($l in @(Get-Content -LiteralPath $a -ErrorAction Stop)) {
+                if ($l -match '^\s*ad\.anynet\.id\s*=\s*(\d+)') {
+                    if (-not $ids.Contains($Matches[1])) { $ids.Add($Matches[1]) }
+                }
+            }
+        }
+        catch { }
+    }
+    return ($ids -join ', ')
+}
+
+function Get-IdTeamViewer {
+    foreach ($clave in @('HKLM:\SOFTWARE\TeamViewer', 'HKLM:\SOFTWARE\WOW6432Node\TeamViewer')) {
+        try {
+            $id = (Get-ItemProperty -Path $clave -Name 'ClientID' -ErrorAction Stop).ClientID
+            if ($id) { return "$id" }
+        }
+        catch { }
+    }
+    return ''
+}
+
+function Get-CuentasUsuario {
+    # Cuenta con la que inicia sesión (Microsoft o de empresa) y cuentas de Office del usuario activo.
+    param($Perfil)
+    $r = [pscustomobject]@{ NombreCompleto = ''; Cuenta = ''; Office = '' }
+    try {
+        $local = Get-LocalUser -SID $Perfil.SID -ErrorAction Stop
+        $r.NombreCompleto = "$($local.FullName)".Trim()
+    }
+    catch { }
+    $cuentas = New-Object System.Collections.Generic.List[string]
+    try {
+        # Caché de identidad de Windows: guarda el correo de la cuenta Microsoft o de Azure AD / Entra
+        $cache = "HKLM:\SOFTWARE\Microsoft\IdentityStore\Cache\$($Perfil.SID)\IdentityCache\$($Perfil.SID)"
+        $nombre = (Get-ItemProperty -Path $cache -Name 'UserName' -ErrorAction Stop).UserName
+        if ("$nombre" -match '@') { $cuentas.Add("$nombre") }
+    }
+    catch { }
+    try {
+        foreach ($k in @(Get-ChildItem -Path "$($Perfil.Registro)\Software\Microsoft\IdentityCRL\UserExtendedProperties" -ErrorAction Stop)) {
+            if ($k.PSChildName -match '@' -and -not $cuentas.Contains($k.PSChildName)) { $cuentas.Add($k.PSChildName) }
+        }
+    }
+    catch { }
+    try {
+        foreach ($k in @(Get-ChildItem -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo' -ErrorAction Stop)) {
+            $correo = (Get-ItemProperty -Path $k.PSPath -ErrorAction Stop).UserEmail
+            if ("$correo" -match '@' -and -not $cuentas.Contains("$correo")) { $cuentas.Add("$correo") }
+        }
+    }
+    catch { }
+    $r.Cuenta = $cuentas -join ', '
+    $office = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($k in @(Get-ChildItem -Path "$($Perfil.Registro)\Software\Microsoft\Office\16.0\Common\Identity\Identities" -ErrorAction Stop)) {
+            $correo = (Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue).EmailAddress
+            if ("$correo" -match '@' -and -not $office.Contains("$correo")) { $office.Add("$correo") }
+        }
+    }
+    catch { }
+    $r.Office = $office -join ', '
+    return $r
+}
+
+function Get-ProgramasInstalados {
+    param($Perfil)
+    $rutas = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        "$($Perfil.Registro)\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    $vistos = @{}
+    $lista = New-Object System.Collections.Generic.List[object]
+    foreach ($ruta in $rutas) {
+        foreach ($p in @(Get-ItemProperty -Path $ruta -ErrorAction SilentlyContinue)) {
+            $nombre = "$($p.DisplayName)".Trim()
+            if (-not $nombre -or $p.SystemComponent -eq 1 -or $p.ParentKeyName) { continue }
+            $clave = '{0}|{1}' -f $nombre, $p.DisplayVersion
+            if ($vistos.ContainsKey($clave)) { continue }
+            $vistos[$clave] = $true
+            $fecha = ''
+            if ("$($p.InstallDate)" -match '^(\d{4})(\d{2})(\d{2})$') { $fecha = '{0}-{1}-{2}' -f $Matches[1], $Matches[2], $Matches[3] }
+            $lista.Add([pscustomobject]@{ Programa = $nombre; Version = "$($p.DisplayVersion)"; Fabricante = "$($p.Publisher)"; Instalado = $fecha })
+        }
+    }
+    return @($lista | Sort-Object -Property Programa)
+}
+
+function Guardar-FichaEquipo {
+    # Junta la información del equipo y del usuario, la guarda en la carpeta del equipo y la deja en la visita.
+    Write-Log 'Recopilando los datos del equipo para el historial...' 'INFO'
+    $perfil = Get-PerfilUsuarioActivo
+    $fab = Get-InfoFabricante
+    $cuentas = Get-CuentasUsuario $perfil
+    $f = [ordered]@{
+        Equipo         = $env:COMPUTERNAME
+        Usuario        = $perfil.Usuario
+        NombreCompleto = $cuentas.NombreCompleto
+        Cuenta         = $cuentas.Cuenta
+        CorreosOffice  = $cuentas.Office
+        Dominio        = ''
+        Marca          = $fab.Marca
+        Modelo         = $fab.Modelo
+        Serie          = $fab.Serie
+        Windows        = $Script:InfoSO
+        AnyDesk        = (Get-IdAnyDesk $perfil)
+        TeamViewer     = (Get-IdTeamViewer)
+        Procesador     = ''
+        RAM            = ''
+        Discos         = ''
+    }
+    try {
+        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        if ($cs.PartOfDomain) { $f.Dominio = 'Dominio: {0}' -f $cs.Domain } else { $f.Dominio = 'Grupo de trabajo: {0}' -f $cs.Workgroup }
+        $f.RAM = '{0} GB' -f [math]::Round($cs.TotalPhysicalMemory / 1GB)
+    }
+    catch { }
+    try { $f.Procesador = (@(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)[0].Name).Trim() } catch { }
+    try {
+        $f.Discos = (@(Get-PhysicalDisk -ErrorAction Stop | Where-Object { "$($_.BusType)" -ne 'USB' } | ForEach-Object {
+                    '{0} ({1}, {2} GB, {3})' -f "$($_.FriendlyName)".Trim(), $_.MediaType, [math]::Round($_.Size / 1GB), $_.HealthStatus
+                }) -join '; ')
+    }
+    catch { }
+    $Sync.Visita.Ficha = [pscustomobject]$f
+    if (Test-SerieValida $fab.Serie) { $Sync.Visita.Serie = $fab.Serie }
+
+    try {
+        $programas = @(Get-ProgramasInstalados $perfil)
+        if ($programas.Count -gt 0) {
+            $rutaProgramas = Join-Path $Script:Base ('Programas_{0}.csv' -f (Get-Date -Format 'yyyyMMdd'))
+            $programas | Export-Csv -LiteralPath $rutaProgramas -NoTypeInformation -Encoding UTF8
+        }
+        $lineas = New-Object System.Collections.Generic.List[string]
+        $lineas.Add(('FICHA DEL EQUIPO {0} (actualizada el {1})' -f $env:COMPUTERNAME, (Get-Date -Format 'dd/MM/yyyy HH:mm')))
+        $lineas.Add(('=' * 60))
+        foreach ($k in $f.Keys) {
+            if ($f[$k]) { $lineas.Add(('{0,-16}: {1}' -f $k, $f[$k])) }
+        }
+        $lineas.Add('')
+        $lineas.Add(('Programas instalados: {0} (lista completa en Programas_<fecha>.csv)' -f $programas.Count))
+        foreach ($p in $programas) { $lineas.Add(('   {0} {1}' -f $p.Programa, $p.Version)) }
+        [System.IO.File]::WriteAllLines((Join-Path $Script:Base 'Ficha_equipo.txt'), $lineas, (New-Object System.Text.UTF8Encoding($true)))
+        Write-Log ('Ficha del equipo guardada en {0}' -f (Join-Path $Script:Base 'Ficha_equipo.txt')) 'OK'
+    }
+    catch {
+        Write-Log "No se pudo guardar la ficha del equipo: $($_.Exception.Message)" 'ADVERTENCIA'
+    }
+    Guardar-Visita
+    return $true
+}
+
+function Guardar-Visita {
+    # Reescribe la fila de esta visita en el historial general y regenera el historial del equipo.
+    # Nunca detiene la herramienta: si falla (USB llena, archivo abierto en Excel), solo lo avisa en el log.
+    $v = $Sync.Visita
+    if (-not $v.Activa) { return }
+    if ($v.Acciones.Count -eq 0 -and -not $v.Diagnostico) { return }
+    [System.Threading.Monitor]::Enter($v)
+    try {
+        $f = $v.Ficha
+        $dato = { param($n) if ($f) { "$($f.$n)" } else { '' } }
+        $antes = ''; if ($null -ne $v.PuntajeAntes) { $antes = "$($v.PuntajeAntes)" }
+        $despues = ''; if ($null -ne $v.PuntajeDespues) { $despues = "$($v.PuntajeDespues)" }
+        $fila = [pscustomobject][ordered]@{
+            Fecha          = $v.Inicio.ToString('dd/MM/yyyy HH:mm')
+            Hasta          = (Get-Date -Format 'HH:mm')
+            Equipo         = $env:COMPUTERNAME
+            Cliente        = "$($v.Cliente)"
+            Usuario        = (& $dato 'Usuario')
+            NombreCompleto = (& $dato 'NombreCompleto')
+            Cuenta         = (& $dato 'Cuenta')
+            CorreosOffice  = (& $dato 'CorreosOffice')
+            Dominio        = (& $dato 'Dominio')
+            Marca          = (& $dato 'Marca')
+            Modelo         = (& $dato 'Modelo')
+            Serie          = "$($v.Serie)"
+            Windows        = $Script:InfoSO
+            AnyDesk        = (& $dato 'AnyDesk')
+            TeamViewer     = (& $dato 'TeamViewer')
+            PuntajeAntes   = $antes
+            PuntajeDespues = $despues
+            Acciones       = (@($v.Acciones) -join '; ')
+            Notas          = "$($v.Notas)"
+            Id             = $v.Id
+        }
+        # 1. Historial general (todas las PCs): se escribe a un temporal y se reemplaza, para no dejarlo a medias
+        $ruta = Get-RutaHistorialGeneral
+        $filas = New-Object System.Collections.Generic.List[object]
+        if (Test-Path -LiteralPath $ruta) {
+            foreach ($x in @(Import-Csv -LiteralPath $ruta -Encoding UTF8 -ErrorAction Stop)) { if ($x.Id -ne $v.Id) { $filas.Add($x) } }
+        }
+        $filas.Add($fila)
+        $tmp = "$ruta.tmp"
+        $filas | Select-Object -Property @($fila.PSObject.Properties.Name) | Export-Csv -LiteralPath $tmp -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $tmp -Destination $ruta -Force -ErrorAction Stop
+
+        # 2. Historial de este equipo, legible
+        $serieValida = Test-SerieValida $v.Serie
+        $propias = @($filas | Where-Object { ($serieValida -and $_.Serie -eq $v.Serie) -or $_.Equipo -eq $env:COMPUTERNAME })
+        $lineas = New-Object System.Collections.Generic.List[string]
+        $lineas.Add(('HISTORIAL DE VISITAS - {0} {1} (serie {2})' -f $fila.Marca, $fila.Modelo, $fila.Serie))
+        $lineas.Add(('=' * 60))
+        foreach ($p in $propias) {
+            $lineas.Add('')
+            $lineas.Add(('{0} a {1} | Equipo: {2} | Cliente: {3}' -f $p.Fecha, $p.Hasta, $p.Equipo, $p.Cliente))
+            if ($p.Usuario) { $lineas.Add(('   Usuario: {0} {1} {2}' -f $p.Usuario, $p.NombreCompleto, $p.Cuenta)) }
+            if ($p.PuntajeAntes) { $lineas.Add(('   Puntaje: {0} -> {1}' -f $p.PuntajeAntes, $p.PuntajeDespues)) }
+            foreach ($a in @("$($p.Acciones)" -split '; ' | Where-Object { $_ })) { $lineas.Add(('   - {0}' -f $a)) }
+            if ($p.Notas) { $lineas.Add(('   Notas: {0}' -f $p.Notas)) }
+        }
+        [System.IO.File]::WriteAllLines((Join-Path $Script:Base 'Historial.txt'), $lineas, (New-Object System.Text.UTF8Encoding($true)))
+    }
+    catch {
+        Write-Log ("No se pudo guardar el historial de visitas (¿está abierto en Excel?): {0}" -f $_.Exception.Message) 'ADVERTENCIA' -SoloArchivo
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($v)
+    }
+}
+
+function Cerrar-Visita {
+    # Al salir: pide (opcional) el cliente y las notas, y guarda la visita por última vez.
+    param([string]$Cliente, [string]$Notas)
+    $v = $Sync.Visita
+    if (-not $v.Activa) { return }
+    if ($v.Acciones.Count -eq 0 -and -not $v.Diagnostico) { return }
+    $c = "$Cliente".Trim()
+    if (-not $c) { $c = $v.ClienteAnterior }
+    $v.Cliente = $c
+    $v.Notas = ("$Notas".Trim() -replace '[\r\n]+', ' ')
+    Guardar-Visita
+    Write-Log ('Visita guardada en el historial: {0}' -f (Get-RutaHistorialGeneral)) 'INFO' -SoloArchivo
+    $v.Activa = $false
+}
+
+function Test-VisitaConActividad {
+    return ($Sync.Visita.Activa -and ($Sync.Visita.Acciones.Count -gt 0 -or $Sync.Visita.Diagnostico))
+}
+
+#endregion
+
+function Invoke-Registrada {
+    # Ejecuta una acción de un submenú de consola y la anota en la visita.
+    param([string]$Titulo, [scriptblock]$Accion)
+    $estado = 'Avisos'
+    try {
+        $salida = & $Accion
+        if ([bool](@($salida)[-1])) { $estado = 'OK' }
+    }
+    catch {
+        $estado = 'Error'
+        Write-Log ("Error en '{0}': {1}" -f $Titulo, $_.Exception.Message) 'ERROR'
+    }
+    try { Registrar-AccionVisita $Titulo $estado } catch { }
+}
+
+function Iniciar-VisitaGui {
+    # Después de entrar: avisa si el equipo ya se atendió antes y recopila su ficha en segundo plano.
+    $Script:Gui.AccesoOk = $true
+    try { Iniciar-Visita } catch { }
+    if ($Sync.Visita.AvisoAnterior) { Write-Host ('HISTORIAL: ' + $Sync.Visita.AvisoAnterior) -ForegroundColor Yellow }
+    Ejecutar-TareaGui -Titulo 'Datos del equipo' -Comando 'Guardar-FichaEquipo'
+}
+
 #region ==================== INTERFAZ GRÁFICA: DISEÑO (XAML) ====================
 
 $Script:XamlPrincipal = @'
@@ -5022,13 +5390,19 @@ param($Titulo, $Comando)
 $Script:RequiereReinicio = $false
 Write-Log ("===== Inicio: {0} =====" -f $Titulo) 'INFO' -SoloArchivo
 $ok = $false
+$estado = 'Avisos'
+$Sync.Visita.TareaActual = $Titulo
 try {
     $salida = & ([scriptblock]::Create($Comando))
     $ok = [bool](@($salida)[-1])
+    if ($ok) { $estado = 'OK' }
 }
 catch {
+    $estado = 'Error'
     Write-Log ("Error inesperado en '{0}': {1}" -f $Titulo, $_.Exception.Message) 'ERROR'
 }
+$Sync.Visita.TareaActual = ''
+try { Registrar-AccionVisita $Titulo $estado } catch { }
 try {
     if ($Script:RequiereReinicio) { Preguntar-Reinicio }
 }
@@ -5106,6 +5480,7 @@ function Mostrar-DialogoGui {
     }
     catch { }
     $mensaje.Text = "$($Pregunta.Texto)"
+    if ($Pregunta.Valor) { $entrada.Text = "$($Pregunta.Valor)" }
     switch ($tipo) {
         'SiNo' { $titulo.Text = 'Confirmar' }
         'Texto' {
@@ -5451,6 +5826,7 @@ function Validar-ClaveGui {
         $Script:Gui.Principal.Visibility = [System.Windows.Visibility]::Visible
         $Script:Gui.TxtClave.Clear()
         Write-Log ("Acceso concedido (usuario de Windows: {0})." -f $env:USERNAME) 'INFO' -SoloArchivo
+        Iniciar-VisitaGui
         return
     }
     $Script:Gui.Intentos++
@@ -5477,7 +5853,7 @@ function New-RunspaceGui {
         if (($Script:FuncionesIniciales -notcontains $f.Name) -or $f.Name -eq 'Clear-Host') { $funciones[$f.Name] = $f.Definition }
     }
     $variables = @{ Sync = $Sync; RequiereReinicio = $false }
-    foreach ($v in @('Version', 'Base', 'BaseLocal', 'EnUsb', 'DirLogs', 'DirReportes', 'LogFile', 'NombresAcciones', 'CodigoCoreAudio', 'ClaveIteraciones', 'ModoInterfaz', 'VendoresPci', 'VendoresUsb', 'VendoresAcpi', 'TiposPci', 'TiposUsb')) {
+    foreach ($v in @('Version', 'Base', 'BaseLocal', 'EnUsb', 'DirLogs', 'DirReportes', 'LogFile', 'NombresAcciones', 'CodigoCoreAudio', 'ClaveIteraciones', 'ModoInterfaz', 'InfoSO', 'VendoresPci', 'VendoresUsb', 'VendoresAcpi', 'TiposPci', 'TiposUsb')) {
         $variables[$v] = (Get-Variable -Name $v -Scope Script).Value
     }
     $ps = [powershell]::Create()
@@ -5501,7 +5877,7 @@ function Iniciar-InterfazGrafica {
     [xml]$xaml = $Script:XamlPrincipal
     $ventana = [System.Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
     $Script:Gui = @{
-        Ventana = $ventana; Intentos = 0; DialogoAbierto = $false; CerrarSinPreguntar = $false; HayAcciones = $false
+        Ventana = $ventana; Intentos = 0; DialogoAbierto = $false; CerrarSinPreguntar = $false; HayAcciones = $false; AccesoOk = $false
         BotonesNav = New-Object System.Collections.Generic.List[object]
     }
     $nombres = @('Principal', 'PanelLogin', 'TxtClave', 'TxtErrorClave', 'BtnEntrar', 'TxtEquipo', 'TxtVersion', 'PanelNav',
@@ -5554,12 +5930,29 @@ function Iniciar-InterfazGrafica {
         $Script:Gui.PanelLogin.Visibility = [System.Windows.Visibility]::Visible
         $ventana.Add_ContentRendered({ [void]$Script:Gui.TxtClave.Focus() })
     }
+    else {
+        $ventana.Add_ContentRendered({ Iniciar-VisitaGui })
+    }
 
     $ventana.Add_Closing({
             if ($Script:Sync.Ocupado -and -not $Script:Gui.CerrarSinPreguntar) {
                 $r = Mostrar-DialogoGui @{ Tipo = 'SiNo'; Texto = 'Hay una tarea en curso. Si cierra ahora se interrumpe (DISM o SFC pueden seguir solos en segundo plano). ¿Cerrar de todas formas?' }
-                if ($r -ne 'Si') { $_.Cancel = $true }
+                if ($r -ne 'Si') { $_.Cancel = $true; return }
             }
+            if ($Script:Gui.CerrarSinPreguntar -or -not $Script:Gui.AccesoOk) { return }
+            try {
+                $tarea = "$($Script:Sync.Visita.TareaActual)"
+                if ($tarea) {
+                    $Script:Sync.Visita.TareaActual = ''
+                    Registrar-AccionVisita $tarea 'Interrumpida'
+                }
+                if (Test-VisitaConActividad) {
+                    $cliente = Mostrar-DialogoGui @{ Tipo = 'Texto'; Texto = 'Historial de la visita: nombre del cliente (opcional).'; Valor = $Script:Sync.Visita.ClienteAnterior }
+                    $notas = Mostrar-DialogoGui @{ Tipo = 'Texto'; Texto = 'Historial de la visita: notas, por ejemplo qué problema tenía (opcional).' }
+                    Cerrar-Visita -Cliente $cliente -Notas $notas
+                }
+            }
+            catch { Write-Log ("No se pudo cerrar la visita: {0}" -f $_.Exception.Message) 'ADVERTENCIA' -SoloArchivo }
         })
 
     $Script:RunspaceGui = New-RunspaceGui
@@ -5591,15 +5984,18 @@ function Ejecutar-Opcion {
     param([string]$Nombre, [scriptblock]$Accion)
     Clear-Host
     Write-Log "===== Inicio: $Nombre =====" 'INFO' -SoloArchivo
+    $estado = 'Avisos'
     try {
         $salida = & $Accion
         $ok = [bool](@($salida)[-1])
-        if ($ok) { Write-Log "===== Fin: $Nombre (OK) =====" 'INFO' -SoloArchivo }
+        if ($ok) { $estado = 'OK'; Write-Log "===== Fin: $Nombre (OK) =====" 'INFO' -SoloArchivo }
         else     { Write-Log "===== Fin: $Nombre (con advertencias o cancelado) =====" 'INFO' -SoloArchivo }
     }
     catch {
+        $estado = 'Error'
         Write-Log ("Error inesperado en '{0}': {1}" -f $Nombre, $_.Exception.Message) 'ERROR'
     }
+    try { Registrar-AccionVisita $Nombre $estado } catch { }
     if ($Script:RequiereReinicio) { Preguntar-Reinicio }
     Pausa
 }
@@ -5612,6 +6008,7 @@ function Mostrar-Menu {
     Write-Host ("   {0}" -f $Script:InfoSO) -ForegroundColor DarkGray
     if ($Script:EnUsb) { Write-Host ("   Guardando en la USB: {0}" -f $Script:Base) -ForegroundColor DarkGray }
     elseif ($Script:AvisoUsb) { Write-Host ("   {0}" -f $Script:AvisoUsb) -ForegroundColor Yellow }
+    if ($Sync.Visita.AvisoAnterior) { Write-Host ("   HISTORIAL: {0}" -f $Sync.Visita.AvisoAnterior) -ForegroundColor Yellow }
     Write-Host ('  ' + ('=' * 60)) -ForegroundColor DarkCyan
     Write-Host ''
     Write-Host '   DIAGNÓSTICO' -ForegroundColor Cyan
@@ -5673,6 +6070,10 @@ if ($Script:ModoInterfaz -eq 'Grafica') {
 
 if (-not (Test-Acceso)) { exit }
 
+try { Iniciar-Visita } catch { }
+Write-Host '  Recopilando los datos del equipo...' -ForegroundColor DarkGray
+try { $null = Guardar-FichaEquipo } catch { Write-Log "No se pudo recopilar la ficha del equipo: $($_.Exception.Message)" 'ADVERTENCIA' -SoloArchivo }
+
 $salir = $false
 while (-not $salir) {
     try {
@@ -5713,6 +6114,16 @@ while (-not $salir) {
     }
 }
 
+if (Test-VisitaConActividad) {
+    Write-Host ''
+    Write-Host '  HISTORIAL DE LA VISITA' -ForegroundColor Cyan
+    $sugerido = ''
+    if ($Sync.Visita.ClienteAnterior) { $sugerido = ' (Enter = {0})' -f $Sync.Visita.ClienteAnterior }
+    $cliente = Read-Host ("  Nombre del cliente, opcional{0}" -f $sugerido)
+    $notas = Read-Host '  Notas, por ejemplo qué problema tenía (opcional)'
+    try { Cerrar-Visita -Cliente $cliente -Notas $notas } catch { }
+    Write-Host ("  Historial guardado en: {0}" -f (Get-RutaHistorialGeneral)) -ForegroundColor Cyan
+}
 Write-Log 'Fin de la sesión de Soporte Técnico.' 'INFO' -SoloArchivo
 Write-Host ''
 Write-Host "  Log guardado en: $($Script:LogFile)" -ForegroundColor Cyan
