@@ -1,4 +1,4 @@
-# Soporte Técnico para Windows 10/11 (v2.0)
+# Soporte Técnico para Windows 10/11 (v2.1)
 
 > **Estado: en desarrollo.** La versión 2.0 todavía no se ha probado en un equipo Windows real. Úsela primero en un equipo de prueba.
 
@@ -41,7 +41,7 @@ Solo se ejecuta una tarea a la vez. Las **Herramientas** (Administrador de dispo
 | Disco | Espacio, salud, SMART, **desgaste del SSD, temperatura y errores de lectura**, disco mecánico |
 | Eventos | Pantallazos azules **con el código traducido a causa probable**, apagados inesperados, errores de disco y de hardware |
 | Aplicaciones | Programas que se cierran solos |
-| Drivers | Dispositivos con error y **qué significa cada código** (28 = sin driver, 22 = deshabilitado, 43 = posible falla de hardware) |
+| Drivers | Dispositivos con error y qué significa cada código, **qué es cada dispositivo desconocido** (por ejemplo, "Realtek - tarjeta de red de cable", a partir de su identificador de hardware y sin internet), drivers sin firma, drivers que no cargaron, si Windows Update puede instalar drivers, la herramienta del fabricante instalada e **inventario de drivers** de terceros |
 | Video y drivers | **Driver de video básico de Microsoft** y drivers de más de 5 años |
 | Sonido | Servicios, tarjeta, driver genérico o reciente, salidas deshabilitadas o desconectadas, volumen y silencio |
 | Micrófono y cámara | **Permisos de privacidad bloqueados**, micrófono silenciado, cámara deshabilitada, políticas de la empresa |
@@ -63,6 +63,7 @@ Las **notas** (por ejemplo, "BitLocker activo" o "VPN conectada") son avisos inf
 
 | Categoría | Reparaciones |
 |---|---|
+| Drivers | **Buscar e instalar drivers desde Windows Update** (marca cuáles corrigen un dispositivo con problema), **página de drivers del fabricante** (Dell, HP, Lenovo, ASUS, Acer, MSI...; copia el número de serie), **respaldar todos los drivers** a carpeta o USB, **restaurar o instalar drivers desde carpeta/USB**, **reinstalar un dispositivo**, **revertir el driver** a la versión anterior, **bloquear o permitir que Windows Update instale drivers** |
 | Sistema | DISM + SFC, Windows Update, **desinstalar una actualización**, temporales, disco, **optimizar rendimiento**, **menú Inicio y búsqueda**, **iconos y miniaturas**, Explorador, Store, hora, punto de restauración |
 | Red e internet | Reparar red (completo o suave), **quitar proxy y restablecer hosts**, **limpiar caché de navegadores** |
 | Sonido y dispositivos | Sonido, **micrófono y cámara**, **Bluetooth y USB**, impresora (vacía la cola y la pone en línea), reporte de batería |
@@ -72,7 +73,15 @@ Las **notas** (por ejemplo, "BitLocker activo" o "VPN conectada") son avisos inf
 
 **Optimizar rendimiento** muestra los programas de inicio y usted elige cuáles desactivar. Funciona igual que en el Administrador de tareas, así que es reversible. También ofrece el plan de energía, los efectos visuales y desactivar el inicio rápido.
 
-En la versión de consola, estas reparaciones nuevas están en la opción **17. Reparaciones avanzadas**.
+En la versión de consola, estas reparaciones nuevas (incluidas las de drivers) están en la opción **17. Reparaciones avanzadas**.
+
+**Flujo recomendado para formatear un equipo:**
+1. Drivers > **Respaldar todos los drivers** a una USB.
+2. Formatee e instale Windows.
+3. Drivers > **Restaurar o instalar drivers desde carpeta/USB**.
+4. Para lo que siga sin driver: **Buscar drivers en Windows Update** y luego **Página de drivers del fabricante**.
+
+**Revertir el driver** solo funciona si la versión anterior sigue guardada en Windows. Si no, la herramienta lo avisa y propone las alternativas. Antes de revertir crea un punto de restauración.
 
 ## Usuario del cliente y usuario administrador
 

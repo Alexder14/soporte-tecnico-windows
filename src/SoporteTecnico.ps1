@@ -16,7 +16,7 @@ $Script:FuncionesIniciales = @(Get-ChildItem -Path function: | ForEach-Object { 
 $Script:ModoInterfaz = 'Grafica'
 if ($Consola) { $Script:ModoInterfaz = 'Consola' }
 
-$Script:Version = '2.0'
+$Script:Version = '2.1'
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -812,20 +812,7 @@ function Invoke-Diagnostico {
     }
 
     # ---------- Drivers ----------
-    Rep-Seccion 'Dispositivos y drivers' {
-        $malos = @(Get-PnpDevice -PresentOnly -ErrorAction Stop | Where-Object { "$($_.Status)" -eq 'Error' })
-        if ($malos.Count -eq 0) {
-            Rep-Linea 'Todos los dispositivos funcionan correctamente.'
-        }
-        else {
-            foreach ($d in $malos) {
-                $nombreDisp = "$($d.FriendlyName)"
-                if (-not $nombreDisp) { $nombreDisp = "$($d.InstanceId)" }
-                Rep-Linea ("{0} [{1}] - {2}" -f $nombreDisp, $d.Class, (Get-DescripcionCodigoPnp $d.ConfigManagerErrorCode))
-            }
-            Rep-Alerta ("Hay {0} dispositivo(s) con error de driver." -f $malos.Count) 'Revisar el Administrador de dispositivos (opción 13): código 28 = instalar el driver del fabricante; código 22 = habilitar; código 43 = posible falla de hardware.'
-        }
-    }
+    Rep-Seccion 'Dispositivos y drivers' { Rep-Estado (Get-EstadoDrivers) }
 
     # ---------- Sonido ----------
     Rep-Seccion 'Sonido' {
@@ -1691,6 +1678,7 @@ $Script:NombresAcciones = [ordered]@{
     '7'    = 'Revisar el disco del sistema'
     '2'    = 'Reparar archivos de Windows (DISM + SFC, 10 a 30 min)'
     '5'    = 'Reparar Windows Update'
+    'DRVWU' = 'Instalar desde Windows Update los drivers de dispositivos sin driver'
     'AV'   = 'Actualizar las firmas de Microsoft Defender'
     'SCAN' = 'Escaneo rápido de Microsoft Defender'
     'FW'   = 'Activar el firewall de Windows'
@@ -2797,6 +2785,7 @@ function Invoke-ReparacionAutomatica {
                 '16' { Limpiar-CacheOutlook }
                 '3'  { Reparar-Red -Suave }
                 '5'    { Reparar-WindowsUpdate -SinConfirmar }
+                'DRVWU' { Buscar-DriversWindowsUpdate -Automatico }
                 'SCAN' { Invoke-EscaneoDefender -Tipo 'Rapido' }
                 'FW'   { Activar-Firewall }
                 'SRV'  { Iniciar-ServiciosDetenidos }
@@ -3952,6 +3941,591 @@ function Abrir-Herramienta {
 
 #endregion
 
+#region ==================== DRIVERS: IDENTIFICACIÓN E INVENTARIO ====================
+
+# Tabla de fabricantes por identificador de hardware (sin internet).
+$Script:VendoresPci = @{
+    '8086' = 'Intel'; '10EC' = 'Realtek'; '1022' = 'AMD'; '1002' = 'AMD (Radeon)'; '10DE' = 'NVIDIA'; '14E4' = 'Broadcom'
+    '168C' = 'Qualcomm Atheros'; '17CB' = 'Qualcomm'; '14C3' = 'MediaTek'; '1814' = 'MediaTek (Ralink)'; '1969' = 'Qualcomm Atheros'
+    '11AB' = 'Marvell'; '1B4B' = 'Marvell'; '1B21' = 'ASMedia'; '1912' = 'Renesas'; '104C' = 'Texas Instruments'; '1217' = 'O2Micro'
+    '1180' = 'Ricoh'; '14F1' = 'Conexant (Synaptics)'; '111D' = 'IDT'; '1106' = 'VIA'; '1039' = 'SiS'; '144D' = 'Samsung'
+    '15B7' = 'SanDisk / Western Digital'; '1C5C' = 'SK hynix'; '126F' = 'Silicon Motion'; '1987' = 'Phison'; '1D6A' = 'Aquantia'
+    '197B' = 'JMicron'; '1095' = 'Silicon Image'; '1A03' = 'ASPEED'; '15AD' = 'VMware'; '80EE' = 'VirtualBox'; '1AF4' = 'Red Hat VirtIO'
+    '1414' = 'Microsoft Hyper-V'; '11D4' = 'Analog Devices'; '1AE0' = 'Google'; '1C00' = 'Nuvoton'
+}
+$Script:VendoresUsb = @{
+    '8087' = 'Intel'; '0BDA' = 'Realtek'; '0CF3' = 'Qualcomm Atheros'; '13D3' = 'AzureWave'; '04CA' = 'Lite-On'; '0489' = 'Foxconn'
+    '5986' = 'Acer / Bison'; '04F2' = 'Chicony'; '0C45' = 'Microdia'; '174F' = 'Syntek'; '06CB' = 'Synaptics'; '27C6' = 'Goodix'
+    '138A' = 'Synaptics (Validity)'; '0A5C' = 'Broadcom'; '046D' = 'Logitech'; '045E' = 'Microsoft'; '04E8' = 'Samsung'; '05AC' = 'Apple'
+    '2717' = 'Xiaomi'; '12D1' = 'Huawei'; '18D1' = 'Google'; '22B8' = 'Motorola'; '1004' = 'LG'; '0E8D' = 'MediaTek'; '2C7C' = 'Quectel'
+    '1199' = 'Sierra Wireless'; '03F0' = 'HP'; '04A9' = 'Canon'; '04B8' = 'Epson'; '04F9' = 'Brother'; '0424' = 'Microchip'
+    '05E3' = 'Genesys Logic'; '1A40' = 'Terminus'; '2109' = 'VIA Labs'; '0B95' = 'ASIX'; '1532' = 'Razer'; '1038' = 'SteelSeries'
+    '0951' = 'Kingston'; '0781' = 'SanDisk'; '067B' = 'Prolific'; '1A86' = 'QinHeng (CH340)'; '10C4' = 'Silicon Labs'; '0403' = 'FTDI'
+}
+$Script:VendoresAcpi = @{
+    'INT' = 'Intel'; 'ELAN' = 'ELAN'; 'SYNA' = 'Synaptics'; 'ATML' = 'Atmel'; 'MSFT' = 'Microsoft'; 'AMDI' = 'AMD'; 'QCOM' = 'Qualcomm'
+    'NVDA' = 'NVIDIA'; 'IDEA' = 'Lenovo'; 'LEN' = 'Lenovo'; 'HPQ' = 'HP'; 'DELL' = 'Dell'; 'ASUS' = 'ASUS'; 'ACER' = 'Acer'; 'MSHW' = 'Microsoft Surface'
+    'GDIX' = 'Goodix'; 'WCOM' = 'Wacom'; 'ALPS' = 'ALPS'; 'BCM' = 'Broadcom'; 'SMO' = 'Sensores (SMO)'
+}
+$Script:TiposPci = @{
+    '0100' = 'controladora SCSI'; '0101' = 'controladora IDE'; '0104' = 'controladora RAID'; '0106' = 'controladora SATA (AHCI)'
+    '0108' = 'controladora NVMe'; '0200' = 'tarjeta de red de cable'; '0280' = 'tarjeta de red inalámbrica (WiFi)'; '0300' = 'tarjeta de video'
+    '0302' = 'tarjeta de video'; '0380' = 'tarjeta de video'; '0401' = 'audio'; '0403' = 'audio (HD Audio)'; '0480' = 'multimedia'
+    '0500' = 'controladora de memoria'; '0580' = 'controladora de memoria'; '0600' = 'chipset (puente de host)'; '0601' = 'chipset (puente ISA)'
+    '0604' = 'chipset (puente PCI)'; '0780' = 'comunicaciones (Intel Management Engine o similar)'; '0805' = 'lector de tarjetas SD'
+    '0880' = 'dispositivo del sistema (chipset, sensores o Serial IO)'; '0C03' = 'controladora USB'; '0C05' = 'controladora SMBus (chipset)'
+    '0C80' = 'controladora de bus serie (Serial IO)'; '0D11' = 'Bluetooth'; '1180' = 'controladora térmica o de energía'; '0D80' = 'controladora inalámbrica'
+}
+$Script:TiposUsb = @{
+    '01' = 'audio USB'; '02' = 'módem o comunicaciones'; '03' = 'teclado, mouse o control (HID)'; '06' = 'cámara o escáner'; '07' = 'impresora'
+    '08' = 'almacenamiento USB'; '09' = 'hub USB'; '0B' = 'lector de tarjetas inteligentes'; '0E' = 'cámara web'; 'E0' = 'Bluetooth'; 'FF' = 'específico del fabricante'
+}
+
+function Get-IdentificacionHardware {
+    # Traduce los identificadores de hardware a "fabricante - tipo de dispositivo".
+    param($Dispositivo)
+    $ids = @(@($Dispositivo.HardwareID) + @($Dispositivo.CompatibleID) + @("$($Dispositivo.InstanceId)") | Where-Object { $_ })
+    $texto = ($ids -join ' ').ToUpper()
+    $idPrincipal = "$(@($Dispositivo.HardwareID | Where-Object { $_ })[0])"
+    if (-not $idPrincipal) { $idPrincipal = "$($Dispositivo.InstanceId)" }
+    $fabricante = ''
+    $tipo = ''
+    if ($texto -match 'PCI\\VEN_([0-9A-F]{4})') { $fabricante = $Script:VendoresPci[$Matches[1]]; if (-not $fabricante) { $fabricante = "fabricante PCI $($Matches[1])" } }
+    elseif ($texto -match 'HDAUDIO\\FUNC_[0-9A-F]+&VEN_([0-9A-F]{4})') { $fabricante = $Script:VendoresPci[$Matches[1]]; $tipo = 'audio (HD Audio)'; if (-not $fabricante) { $fabricante = "fabricante $($Matches[1])" } }
+    elseif ($texto -match '(?:USB|HID)\\VID_([0-9A-F]{4})') { $fabricante = $Script:VendoresUsb[$Matches[1]]; if (-not $fabricante) { $fabricante = "fabricante USB $($Matches[1])" } }
+    elseif ($texto -match 'ACPI\\VEN_([A-Z0-9]{3,4})') { $fabricante = $Script:VendoresAcpi[$Matches[1]] }
+    elseif ($texto -match 'ACPI\\([A-Z]{3,4})[0-9A-F]{4}') {
+        $prefijo = $Matches[1]
+        $fabricante = $Script:VendoresAcpi[$prefijo]
+        if (-not $fabricante -and $prefijo.Length -eq 4) { $fabricante = $Script:VendoresAcpi[$prefijo.Substring(0, 3)] }
+    }
+    if (-not $tipo) {
+        if ($texto -match 'PCI\\CC_([0-9A-F]{4})') { $tipo = $Script:TiposPci[$Matches[1]] }
+        elseif ($texto -match 'USB\\CLASS_([0-9A-F]{2})') { $tipo = $Script:TiposUsb[$Matches[1]] }
+        elseif ($texto -match '^ACPI\\|\sACPI\\') { $tipo = 'dispositivo de la placa (ACPI: chipset, touchpad, sensores o botones)' }
+        elseif ($texto -match 'BTH') { $tipo = 'dispositivo Bluetooth' }
+    }
+    if (-not $fabricante) { $fabricante = 'fabricante desconocido' }
+    if (-not $tipo) { $tipo = 'tipo desconocido' }
+    return [pscustomobject]@{ Fabricante = $fabricante; Tipo = $tipo; Id = $idPrincipal; Texto = ('{0} - {1}' -f $fabricante, $tipo) }
+}
+
+function Get-InfoFabricante {
+    # Marca, modelo, serie, página de drivers y herramientas del fabricante instaladas.
+    $info = [pscustomobject]@{ Marca = ''; Modelo = ''; Serie = ''; Url = ''; Herramientas = @(); Generico = $false }
+    try {
+        $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        $bios = Get-CimInstance -ClassName Win32_BIOS -ErrorAction SilentlyContinue
+        $placa = Get-CimInstance -ClassName Win32_BaseBoard -ErrorAction SilentlyContinue
+        $fabricante = "$($cs.Manufacturer)".Trim()
+        $info.Modelo = "$($cs.Model)".Trim()
+        $info.Serie = "$($bios.SerialNumber)".Trim()
+        if ($fabricante -match 'O\.?E\.?M|System manufacturer|Default string|To Be Filled') {
+            # PC armada: usar la placa madre
+            $info.Generico = $true
+            $fabricante = "$($placa.Manufacturer)".Trim()
+            $info.Modelo = "$($placa.Product)".Trim()
+        }
+        $serie = [uri]::EscapeDataString($info.Serie)
+        switch -Regex ($fabricante) {
+            'Dell' { $info.Marca = 'Dell'; $info.Url = "https://www.dell.com/support/home/es-es/product-support/servicetag/$serie/drivers" }
+            'HP|Hewlett' { $info.Marca = 'HP'; $info.Url = 'https://support.hp.com/es-es/drivers' }
+            'Lenovo' { $info.Marca = 'Lenovo'; $info.Url = 'https://pcsupport.lenovo.com/' }
+            'ASUS' { $info.Marca = 'ASUS'; $info.Url = 'https://www.asus.com/es/support/download-center/' }
+            'Acer' { $info.Marca = 'Acer'; $info.Url = 'https://www.acer.com/latam/es/support/drivers-and-manuals' }
+            'Micro-Star|MSI' { $info.Marca = 'MSI'; $info.Url = 'https://www.msi.com/support' }
+            'Gigabyte' { $info.Marca = 'Gigabyte'; $info.Url = 'https://www.gigabyte.com/Support' }
+            'ASRock' { $info.Marca = 'ASRock'; $info.Url = 'https://www.asrock.com/support/index.asp' }
+            'Samsung' { $info.Marca = 'Samsung'; $info.Url = 'https://www.samsung.com/latin/support/' }
+            'Toshiba|Dynabook' { $info.Marca = 'Dynabook (Toshiba)'; $info.Url = 'https://support.dynabook.com/' }
+            'Microsoft' { $info.Marca = 'Microsoft Surface'; $info.Url = 'https://support.microsoft.com/es-es/surface' }
+            'VMware|innotek|QEMU|Xen' { $info.Marca = 'Máquina virtual'; $info.Url = '' }
+            default { $info.Marca = $fabricante }
+        }
+        if (-not $info.Marca) { $info.Marca = 'desconocido' }
+    }
+    catch { }
+
+    $patron = 'Lenovo Vantage|Lenovo System Update|Lenovo Commercial Vantage|SupportAssist|Dell Command \| Update|Dell Update|HP Support Assistant|HP Image Assistant|MyASUS|ASUS Live Update|Armoury Crate|Acer Care Center|Acer Product Registration|MSI Center|Dragon Center|Intel.*Driver.*Support Assistant|AMD Software|NVIDIA App|GeForce Experience'
+    $encontradas = New-Object System.Collections.Generic.List[string]
+    foreach ($ruta in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
+        foreach ($p in @(Get-ItemProperty -Path $ruta -ErrorAction SilentlyContinue)) {
+            $nombre = "$($p.DisplayName)"
+            if ($nombre -match $patron -and -not $encontradas.Contains($nombre)) { $encontradas.Add($nombre) }
+        }
+    }
+    try {
+        $apps = @{ 'E046963F.LenovoCompanion' = 'Lenovo Vantage'; 'E046963F.LenovoSettingsforEnterprise' = 'Lenovo Commercial Vantage'; 'B9ECED6F.ASUSPCAssistant' = 'MyASUS'; 'AD2F1837.HPSupportAssistant' = 'HP Support Assistant'; 'DellInc.DellSupportAssistforPCs' = 'Dell SupportAssist' }
+        foreach ($k in $apps.Keys) {
+            if (@(Get-AppxPackage -AllUsers -Name $k -ErrorAction SilentlyContinue).Count -gt 0 -and -not $encontradas.Contains($apps[$k])) { $encontradas.Add($apps[$k]) }
+        }
+    }
+    catch { }
+    $info.Herramientas = $encontradas.ToArray()
+    return $info
+}
+
+function Test-BloqueoDriversWU {
+    $pol = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -ErrorAction SilentlyContinue).ExcludeWUDriversInQualityUpdate
+    $orden = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching' -ErrorAction SilentlyContinue).SearchOrderConfig
+    return (($null -ne $pol -and [int]$pol -eq 1) -or ($null -ne $orden -and [int]$orden -eq 0))
+}
+
+function Get-DispositivosConProblema {
+    return @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object {
+            [int]$_.ConfigManagerErrorCode -ne 0 -and "$($_.Class)" -ne 'AudioEndpoint'
+        })
+}
+
+function Get-EstadoDrivers {
+    $r = Nuevo-Estado
+
+    # 1. Dispositivos con problemas, identificados por su hardware
+    $malos = @(Get-DispositivosConProblema)
+    if ($malos.Count -eq 0) {
+        $r.Lineas.Add('Todos los dispositivos tienen driver y funcionan.')
+    }
+    foreach ($d in $malos) {
+        $codigo = [int]$d.ConfigManagerErrorCode
+        $id = Get-IdentificacionHardware $d
+        $nombre = "$($d.FriendlyName)"
+        if (-not $nombre) { $nombre = 'Dispositivo desconocido' }
+        $r.Lineas.Add(("{0} [{1}] - {2}" -f $nombre, $d.Class, (Get-DescripcionCodigoPnp $codigo)))
+        $r.Lineas.Add(("   Es: {0} | {1}" -f $id.Texto, $id.Id))
+        if ($codigo -eq 28 -or $codigo -eq 1 -or $codigo -eq 18) {
+            $r.Problemas.Add((Nuevo-Problema -Texto ("'{0}' no tiene driver. Es: {1}." -f $nombre, $id.Texto) -Sugerencia ("Drivers > ""Buscar drivers en Windows Update""; si no aparece, descargar el driver de {0} o de la página del fabricante del equipo." -f $id.Fabricante) -Critica -Accion 'DRVWU'))
+        }
+        elseif ($codigo -eq 22) {
+            $r.Problemas.Add((Nuevo-Problema -Texto ("'{0}' está deshabilitado." -f $nombre) -Sugerencia 'Habilitarlo en el Administrador de dispositivos si se necesita.' -Info))
+        }
+        elseif ($codigo -eq 45 -or $codigo -eq 24) {
+            $r.Lineas.Add('   (desconectado o no presente: normal si se desenchufó)')
+        }
+        else {
+            $r.Problemas.Add((Nuevo-Problema -Texto ("'{0}' tiene un error: {1}." -f $nombre, (Get-DescripcionCodigoPnp $codigo)) -Sugerencia 'Drivers > "Reinstalar un dispositivo"; si empezó después de una actualización, "Revertir el driver".' -Critica))
+        }
+    }
+
+    # 2. Drivers sin firma y drivers que no cargaron
+    try {
+        $firmados = @(Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop)
+        $sinFirma = @($firmados | Where-Object { $_.DeviceName -and $_.InfName -and $_.IsSigned -eq $false })
+        foreach ($x in $sinFirma) { $r.Lineas.Add(("Driver SIN FIRMA: {0} | {1} | {2}" -f $x.DeviceName, $x.DriverProviderName, $x.InfName)) }
+        if ($sinFirma.Count -gt 0) {
+            $r.Problemas.Add((Nuevo-Problema -Texto ("Hay {0} driver(s) sin firma digital." -f $sinFirma.Count) -Sugerencia 'Reemplazarlos por la versión oficial del fabricante: los drivers sin firma pueden causar pantallazos azules.'))
+        }
+    }
+    catch { $firmados = @() }
+    try {
+        $arranque = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+        $fallos = @(Get-EventosSeguro -Log 'System' -Proveedores @('Microsoft-Windows-Kernel-PnP') -Ids @(219) -Desde $arranque)
+        if ($fallos.Count -gt 0) {
+            $nombres = @($fallos | ForEach-Object { $d = Get-DatosEvento $_; "$($d['DriverName'])" } | Where-Object { $_ } | Select-Object -Unique -First 5)
+            $r.Lineas.Add(("Drivers que no cargaron en el último arranque: {0} ({1})" -f $fallos.Count, ($nombres -join ', ')))
+            $r.Problemas.Add((Nuevo-Problema -Texto ("{0} driver(s) no cargaron en el último arranque." -f $fallos.Count) -Sugerencia 'Suele ser inofensivo; si un dispositivo no funciona, reinstalarlo o actualizar su driver.' -Info))
+        }
+    }
+    catch { }
+
+    # 3. Windows Update y herramienta del fabricante
+    if (Test-BloqueoDriversWU) { $r.Lineas.Add('Windows Update: NO instala drivers automáticamente (bloqueado).') }
+    else { $r.Lineas.Add('Windows Update: puede instalar drivers automáticamente.') }
+    $fab = Get-InfoFabricante
+    $r.Lineas.Add(("Fabricante: {0} | Modelo: {1} | Serie: {2}" -f $fab.Marca, $fab.Modelo, $fab.Serie))
+    if ($fab.Herramientas.Count -gt 0) {
+        $r.Lineas.Add(("Herramienta de drivers del fabricante: {0}" -f ($fab.Herramientas -join ', ')))
+    }
+    elseif ($fab.Url) {
+        $r.Problemas.Add((Nuevo-Problema -Texto ("No hay instalada una herramienta de drivers de {0}." -f $fab.Marca) -Sugerencia 'Drivers > "Página de drivers del fabricante": abre la página de soporte del equipo.' -Info))
+    }
+
+    # 4. Inventario de drivers de terceros
+    $terceros = @($firmados | Where-Object { $_.DeviceName -and $_.InfName -like 'oem*.inf' } | Sort-Object -Property DriverProviderName, DeviceName)
+    $r.Lineas.Add(("Inventario: {0} driver(s) de fabricantes (además de los de Microsoft):" -f $terceros.Count))
+    foreach ($x in ($terceros | Select-Object -First 80)) {
+        $fecha = ''
+        if ($x.DriverDate) { $fecha = ([datetime]$x.DriverDate).ToString('dd/MM/yyyy') }
+        $firma = 'firmado'; if ($x.IsSigned -eq $false) { $firma = 'SIN FIRMA' }
+        $r.Lineas.Add(("   {0} | {1} | {2} | {3} | {4}" -f $x.DriverProviderName, $x.DeviceName, $x.DriverVersion, $fecha, $firma))
+    }
+    return $r
+}
+
+#endregion
+
+#region ==================== DRIVERS: ACCIONES ====================
+
+function Test-CodigoPnputil {
+    # pnputil: 0 = correcto, 3010 = correcto pero requiere reiniciar
+    param([int]$Codigo)
+    if ($Codigo -eq 3010) { $Script:RequiereReinicio = $true; return $true }
+    return ($Codigo -eq 0)
+}
+
+function Buscar-DriversWindowsUpdate {
+    param([switch]$Automatico)
+    Mostrar-Titulo 'BUSCAR DRIVERS EN WINDOWS UPDATE'
+    if (Test-BloqueoDriversWU) {
+        Write-Log 'Los drivers por Windows Update están bloqueados en este equipo; puede que no aparezca ninguno (ver "Bloquear drivers de Windows Update").' 'ADVERTENCIA'
+    }
+    $null = Iniciar-Servicio 'wuauserv' -HabilitarSiDeshabilitado
+    Write-Log 'Buscando drivers en Windows Update (puede tardar de 1 a 5 minutos)...' 'INFO'
+    try {
+        $sesion = New-Object -ComObject Microsoft.Update.Session
+        $sesion.ClientApplicationID = 'SoporteTecnico'
+        $buscador = $sesion.CreateUpdateSearcher()
+        $buscador.ServerSelection = 2   # Windows Update directo (no WSUS)
+        $resultado = $buscador.Search("IsInstalled=0 and Type='Driver' and IsHidden=0")
+    }
+    catch {
+        Write-Log "No se pudo buscar en Windows Update: $($_.Exception.Message)" 'ERROR'
+        Write-Log 'Revise la conexión a internet o use "Reparar Windows Update".' 'INFO'
+        return $false
+    }
+    $total = $resultado.Updates.Count
+    if ($total -eq 0) {
+        Write-Log 'Windows Update no tiene drivers nuevos para este equipo.' 'OK'
+        $malos = @(Get-DispositivosConProblema | Where-Object { [int]$_.ConfigManagerErrorCode -eq 28 })
+        if ($malos.Count -gt 0) {
+            Write-Log 'Hay dispositivos sin driver: use "Página de drivers del fabricante" o "Instalar drivers desde carpeta/USB".' 'ADVERTENCIA'
+        }
+        return $true
+    }
+
+    # Qué dispositivos con problema corrige cada driver
+    $problemas = @(Get-DispositivosConProblema)
+    $lista = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $total; $i++) {
+        $u = $resultado.Updates.Item($i)
+        $hw = "$($u.DriverHardwareID)"
+        $corrige = ''
+        foreach ($d in $problemas) {
+            foreach ($idHw in @($d.HardwareID) + @($d.CompatibleID)) {
+                if ($idHw -and $hw -and ("$idHw" -ieq $hw)) { $corrige = "$($d.FriendlyName)"; if (-not $corrige) { $corrige = 'dispositivo desconocido' } }
+            }
+        }
+        $fecha = ''
+        try { $fecha = ([datetime]$u.DriverVerDate).ToString('dd/MM/yyyy') } catch { }
+        $lista.Add([pscustomobject]@{ Update = $u; Titulo = "$($u.Title)"; Clase = "$($u.DriverClass)"; Fecha = $fecha; Corrige = $corrige })
+    }
+
+    Write-Host ''
+    Write-Host '    Drivers disponibles:' -ForegroundColor Cyan
+    for ($i = 0; $i -lt $lista.Count; $i++) {
+        $x = $lista[$i]
+        $marca = ''
+        if ($x.Corrige) { $marca = "  [CORRIGE: $($x.Corrige)]" }
+        $color = 'White'; if ($x.Corrige) { $color = 'Green' }
+        Write-Host ("    {0,2}. {1} ({2}, {3}){4}" -f ($i + 1), $x.Titulo, $x.Clase, $x.Fecha, $marca) -ForegroundColor $color
+    }
+    Write-Host ''
+
+    $elegidos = New-Object System.Collections.Generic.List[object]
+    if ($Automatico) {
+        foreach ($x in $lista) { if ($x.Corrige) { $elegidos.Add($x) } }
+        if ($elegidos.Count -eq 0) {
+            Write-Log 'Ninguno de estos drivers corresponde a un dispositivo con problema; no se instala nada automáticamente.' 'INFO'
+            return $true
+        }
+    }
+    else {
+        $resp = Read-Host '  Números a instalar separados por coma, "todos", o Enter para cancelar'
+        if ("$resp".Trim() -match '^(todos|t)$') {
+            foreach ($x in $lista) { $elegidos.Add($x) }
+        }
+        else {
+            foreach ($parte in ("$resp" -split '[,; ]+')) {
+                $n = 0
+                if ([int]::TryParse($parte, [ref]$n) -and $n -ge 1 -and $n -le $lista.Count) { $elegidos.Add($lista[$n - 1]) }
+            }
+        }
+        if ($elegidos.Count -eq 0) { Write-Log 'Instalación de drivers cancelada.' 'INFO'; return $false }
+    }
+
+    try {
+        $coleccion = New-Object -ComObject Microsoft.Update.UpdateColl
+        foreach ($x in $elegidos) {
+            if (-not $x.Update.EulaAccepted) { $x.Update.AcceptEula() }
+            [void]$coleccion.Add($x.Update)
+        }
+        Write-Log ("Descargando {0} driver(s)..." -f $coleccion.Count) 'INFO'
+        $descargador = $sesion.CreateUpdateDownloader()
+        $descargador.Updates = $coleccion
+        [void]$descargador.Download()
+        Write-Log 'Instalando...' 'INFO'
+        $instalador = $sesion.CreateUpdateInstaller()
+        $instalador.Updates = $coleccion
+        $res = $instalador.Install()
+        $ok = $true
+        for ($i = 0; $i -lt $coleccion.Count; $i++) {
+            $codigo = [int]$res.GetUpdateResult($i).ResultCode
+            $titulo = $coleccion.Item($i).Title
+            if ($codigo -eq 2 -or $codigo -eq 3) { Write-Log "Instalado: $titulo" 'OK' }
+            else { Write-Log "No se pudo instalar: $titulo (código $codigo)" 'ERROR'; $ok = $false }
+        }
+        if ($res.RebootRequired) { $Script:RequiereReinicio = $true }
+        return $ok
+    }
+    catch {
+        Write-Log "Error al instalar los drivers: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+}
+
+function Respaldar-Drivers {
+    Mostrar-Titulo 'RESPALDAR DRIVERS'
+    Write-Host '    Copia todos los drivers de fabricantes instalados (no los de Microsoft, que vienen con Windows).' -ForegroundColor DarkGray
+    Write-Host '    Úselo antes de formatear: después se restauran con "Restaurar o instalar drivers desde carpeta/USB".' -ForegroundColor DarkGray
+    $predeterminada = Join-Path $Script:Base ('Drivers_{0}_{1}' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd'))
+    $resp = Read-Host ("  Carpeta de destino, por ejemplo E:\ para una USB (Enter = {0})" -f $predeterminada)
+    $destino = "$resp".Trim().Trim('"')
+    if (-not $destino) { $destino = $predeterminada }
+    elseif ($destino -match '^[A-Za-z]:\\?$') { $destino = Join-Path $destino.Substring(0, 2) ('Drivers_{0}_{1}' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd')) }
+    try {
+        if (-not (Test-Path -LiteralPath $destino)) { New-Item -ItemType Directory -Path $destino -Force -ErrorAction Stop | Out-Null }
+    }
+    catch {
+        Write-Log "No se pudo crear la carpeta ${destino}: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+    Write-Log "Exportando drivers a $destino (puede tardar unos minutos)..." 'INFO'
+    $codigo = Invoke-Nativo -Archivo (Get-RutaSistema 'pnputil.exe') -Argumentos ('/export-driver * "{0}"' -f $destino) -Descripcion 'Exportar drivers'
+    $infs = @(Get-ChildItem -LiteralPath $destino -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
+    if ($infs.Count -eq 0) {
+        Write-Log 'No se exportó ningún driver.' 'ERROR'
+        return $false
+    }
+    # Inventario para saber qué hay en el respaldo
+    try {
+        $inventario = Join-Path $destino 'inventario_drivers.csv'
+        Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop |
+            Where-Object { $_.InfName -like 'oem*.inf' } |
+            Select-Object DeviceName, DeviceClass, DriverProviderName, DriverVersion, @{ n = 'DriverDate'; e = { if ($_.DriverDate) { ([datetime]$_.DriverDate).ToString('yyyy-MM-dd') } } }, InfName, HardWareID |
+            Export-Csv -LiteralPath $inventario -NoTypeInformation -Encoding UTF8
+        $leeme = @(
+            "Respaldo de drivers de $env:COMPUTERNAME - $(Get-Date -Format 'dd/MM/yyyy HH:mm')",
+            "Equipo: $((Get-InfoFabricante).Marca) $((Get-InfoFabricante).Modelo)",
+            '',
+            'Para restaurar: Soporte Técnico > Drivers > "Restaurar o instalar drivers desde carpeta/USB"',
+            'o en una consola de administrador:  pnputil /add-driver "<esta carpeta>\*.inf" /subdirs /install'
+        )
+        [System.IO.File]::WriteAllLines((Join-Path $destino 'LEEME.txt'), $leeme, (New-Object System.Text.UTF8Encoding($true)))
+    }
+    catch { }
+    $tamano = [math]::Round((Get-TamanoCarpeta $destino) / 1MB)
+    Write-Log ("Respaldo listo: {0} drivers ({1} MB) en {2}" -f $infs.Count, $tamano, $destino) 'OK'
+    return (Test-CodigoPnputil $codigo) -or ($infs.Count -gt 0)
+}
+
+function Instalar-DriversCarpeta {
+    Mostrar-Titulo 'RESTAURAR O INSTALAR DRIVERS DESDE CARPETA / USB'
+    Write-Host '    Sirve para un respaldo hecho con esta herramienta o para drivers descargados del fabricante' -ForegroundColor DarkGray
+    Write-Host '    (si el driver viene como .exe, ejecútelo directamente; si viene en .zip, descomprímalo primero).' -ForegroundColor DarkGray
+    $resp = Read-Host '  Carpeta con los drivers (por ejemplo E:\Drivers_PC01_20261120)'
+    $carpeta = "$resp".Trim().Trim('"')
+    if (-not $carpeta -or -not (Test-Path -LiteralPath $carpeta -PathType Container)) {
+        Write-Log "La carpeta no existe: $carpeta" 'ERROR'
+        return $false
+    }
+    $infs = @(Get-ChildItem -LiteralPath $carpeta -Filter '*.inf' -Recurse -File -ErrorAction SilentlyContinue)
+    if ($infs.Count -eq 0) {
+        Write-Log 'La carpeta no contiene archivos .inf (drivers). Si el driver es un .exe, ejecútelo directamente.' 'ERROR'
+        return $false
+    }
+    Write-Host ("    Se encontraron {0} archivo(s) .inf." -f $infs.Count) -ForegroundColor Cyan
+    if (-not (Confirmar '¿Instalar estos drivers? (se crea antes un punto de restauración)')) { return $false }
+    $null = New-PuntoRestauracion
+    $antes = @(Get-DispositivosConProblema).Count
+    $codigo = Invoke-Nativo -Archivo (Get-RutaSistema 'pnputil.exe') -Argumentos ('/add-driver "{0}" /subdirs /install' -f (Join-Path $carpeta '*.inf')) -Descripcion 'Instalar drivers'
+    if ((Get-BuildWindows) -ge 19041) {
+        $null = Invoke-Nativo -Archivo (Get-RutaSistema 'pnputil.exe') -Argumentos '/scan-devices' -Descripcion 'Buscar cambios de hardware'
+    }
+    Start-Sleep -Seconds 3
+    $despues = @(Get-DispositivosConProblema).Count
+    Write-Log ("Dispositivos con problema: antes {0}, después {1}." -f $antes, $despues) 'INFO'
+    Write-Log 'Algunos drivers se terminan de aplicar al reiniciar.' 'INFO'
+    $Script:RequiereReinicio = $true
+    return ((Test-CodigoPnputil $codigo) -or $despues -lt $antes)
+}
+
+function Get-ListaDispositivosElegibles {
+    # Dispositivos que es seguro reinstalar o revertir (no discos, procesador ni chipset base).
+    $clases = @('MEDIA', 'Net', 'Display', 'Bluetooth', 'Camera', 'Image', 'Printer', 'USB', 'HIDClass', 'Mouse', 'Keyboard', 'Biometric', 'SmartCardReader', 'Sensor', 'Ports', 'Modem', 'WPD', 'SDHost', 'Monitor')
+    $todos = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object {
+            ([int]$_.ConfigManagerErrorCode -ne 0 -and "$($_.Class)" -ne 'AudioEndpoint') -or ($clases -contains "$($_.Class)")
+        })
+    $conProblema = @($todos | Where-Object { [int]$_.ConfigManagerErrorCode -ne 0 } | Sort-Object -Property Class, FriendlyName)
+    $resto = @($todos | Where-Object { [int]$_.ConfigManagerErrorCode -eq 0 } | Sort-Object -Property Class, FriendlyName)
+    return @($conProblema + $resto)
+}
+
+function Elegir-Dispositivo {
+    param([string]$Pregunta)
+    $lista = @(Get-ListaDispositivosElegibles)
+    if ($lista.Count -eq 0) { Write-Log 'No hay dispositivos para elegir.' 'INFO'; return $null }
+    for ($i = 0; $i -lt $lista.Count; $i++) {
+        $d = $lista[$i]
+        $nombre = "$($d.FriendlyName)"
+        if (-not $nombre) { $nombre = 'Dispositivo desconocido' }
+        $estado = ''
+        $color = 'White'
+        if ([int]$d.ConfigManagerErrorCode -ne 0) { $estado = '  <- ' + (Get-DescripcionCodigoPnp $d.ConfigManagerErrorCode); $color = 'Yellow' }
+        Write-Host ("    {0,2}. [{1}] {2}{3}" -f ($i + 1), $d.Class, $nombre, $estado) -ForegroundColor $color
+    }
+    Write-Host ''
+    $resp = Read-Host $Pregunta
+    $n = 0
+    if ([int]::TryParse("$resp", [ref]$n) -and $n -ge 1 -and $n -le $lista.Count) { return $lista[$n - 1] }
+    Write-Log 'Operación cancelada.' 'INFO'
+    return $null
+}
+
+function Reinstalar-Dispositivo {
+    Mostrar-Titulo 'REINSTALAR UN DISPOSITIVO'
+    if ((Get-BuildWindows) -lt 19041) {
+        Write-Log 'Esta función necesita Windows 10 versión 2004 o superior. Use el Administrador de dispositivos > Desinstalar dispositivo > Buscar cambios de hardware.' 'ADVERTENCIA'
+        return $false
+    }
+    Write-Host '    Se quita el dispositivo y Windows lo vuelve a detectar con su driver (los problemas aparecen primero).' -ForegroundColor DarkGray
+    Write-Host ''
+    $d = Elegir-Dispositivo '  Número del dispositivo a reinstalar (Enter = cancelar)'
+    if (-not $d) { return $false }
+    if ("$($d.Class)" -eq 'Net') { Mostrar-AvisoSesionRemota }
+    if ("$($d.Class)" -in @('Keyboard', 'Mouse', 'HIDClass', 'USB')) {
+        Write-Host '    El teclado, el mouse o los puertos USB pueden dejar de responder unos segundos.' -ForegroundColor Yellow
+    }
+    if (-not (Confirmar ("¿Reinstalar '{0}'?" -f $d.FriendlyName))) { return $false }
+    $pnputil = Get-RutaSistema 'pnputil.exe'
+    $c1 = Invoke-Nativo -Archivo $pnputil -Argumentos ('/remove-device "{0}"' -f $d.InstanceId) -Descripcion 'Quitar dispositivo'
+    Start-Sleep -Seconds 2
+    $null = Invoke-Nativo -Archivo $pnputil -Argumentos '/scan-devices' -Descripcion 'Detectar hardware de nuevo'
+    Start-Sleep -Seconds 5
+    $nuevo = Get-PnpDevice -InstanceId $d.InstanceId -ErrorAction SilentlyContinue
+    if ($nuevo -and [int]$nuevo.ConfigManagerErrorCode -eq 0) {
+        Write-Log ("'{0}' se reinstaló y funciona." -f $nuevo.FriendlyName) 'OK'
+        return $true
+    }
+    if ($nuevo) {
+        Write-Log ("'{0}' se reinstaló pero sigue con: {1}" -f $nuevo.FriendlyName, (Get-DescripcionCodigoPnp $nuevo.ConfigManagerErrorCode)) 'ADVERTENCIA'
+        Write-Log 'Siguiente paso: "Buscar drivers en Windows Update" o el driver del fabricante.' 'INFO'
+    }
+    else {
+        Write-Log 'Windows todavía no detectó el dispositivo de nuevo; puede requerir reiniciar.' 'ADVERTENCIA'
+        $Script:RequiereReinicio = $true
+    }
+    return (Test-CodigoPnputil $c1)
+}
+
+function Revertir-Driver {
+    Mostrar-Titulo 'REVERTIR EL DRIVER DE UN DISPOSITIVO'
+    Write-Host '    Vuelve a la versión anterior del driver si todavía está guardada en el equipo.' -ForegroundColor DarkGray
+    Write-Host ''
+    $d = Elegir-Dispositivo '  Número del dispositivo cuyo driver quiere revertir (Enter = cancelar)'
+    if (-not $d) { return $false }
+    try {
+        $actual = Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop | Where-Object { $_.DeviceID -eq $d.InstanceId } | Select-Object -First 1
+    }
+    catch { $actual = $null }
+    if (-not $actual -or "$($actual.InfName)" -notlike 'oem*.inf') {
+        Write-Log 'Este dispositivo usa un driver incluido en Windows; no hay versión anterior que restaurar.' 'ADVERTENCIA'
+        return $false
+    }
+    Write-Log ("Driver actual: {0} versión {1} ({2})" -f $actual.DriverProviderName, $actual.DriverVersion, $actual.InfName) 'INFO'
+    try {
+        $almacen = @(Get-WindowsDriver -Online -ErrorAction Stop)
+    }
+    catch {
+        Write-Log "No se pudo leer el almacén de drivers: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+    $paquete = $almacen | Where-Object { $_.Driver -ieq $actual.InfName } | Select-Object -First 1
+    if (-not $paquete) { Write-Log 'No se encontró el paquete del driver actual.' 'ERROR'; return $false }
+    $original = Split-Path $paquete.OriginalFileName -Leaf
+    $anteriores = @($almacen | Where-Object { $_.Driver -ine $actual.InfName -and (Split-Path $_.OriginalFileName -Leaf) -ieq $original } | Sort-Object -Property Version -Descending)
+    if ($anteriores.Count -eq 0) {
+        Write-Log 'No hay otra versión de este driver guardada en el equipo.' 'ADVERTENCIA'
+        Write-Log 'Alternativas: "Reinstalar un dispositivo", "Buscar drivers en Windows Update" o el driver del fabricante.' 'INFO'
+        return $false
+    }
+    foreach ($a in $anteriores) { Write-Log ("Versión disponible: {0} ({1})" -f $a.Version, $a.Driver) 'INFO' }
+    if (-not (Confirmar ("¿Quitar la versión {0} para que Windows use la {1}? (se crea un punto de restauración)" -f $actual.DriverVersion, $anteriores[0].Version))) { return $false }
+    if ("$($d.Class)" -eq 'Net') { Mostrar-AvisoSesionRemota }
+    $null = New-PuntoRestauracion
+    $pnputil = Get-RutaSistema 'pnputil.exe'
+    $codigo = Invoke-Nativo -Archivo $pnputil -Argumentos ('/delete-driver {0} /uninstall /force' -f $actual.InfName) -Descripcion 'Quitar la versión actual del driver'
+    if ((Get-BuildWindows) -ge 19041) {
+        $null = Invoke-Nativo -Archivo $pnputil -Argumentos '/scan-devices' -Descripcion 'Detectar hardware de nuevo'
+    }
+    Start-Sleep -Seconds 5
+    $nuevo = Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction SilentlyContinue | Where-Object { $_.DeviceID -eq $d.InstanceId } | Select-Object -First 1
+    if ($nuevo) { Write-Log ("Driver en uso ahora: {0} versión {1}" -f $nuevo.DriverProviderName, $nuevo.DriverVersion) 'OK' }
+    Write-Log 'Para que Windows Update no vuelva a instalar la versión nueva, use "Bloquear drivers de Windows Update".' 'INFO'
+    $Script:RequiereReinicio = $true
+    return (Test-CodigoPnputil $codigo)
+}
+
+function Cambiar-BloqueoDriversWU {
+    Mostrar-Titulo 'BLOQUEAR DRIVERS DE WINDOWS UPDATE'
+    $bloqueado = Test-BloqueoDriversWU
+    $politica = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $busqueda = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching'
+    if ($bloqueado) {
+        Write-Host '    Estado actual: Windows Update NO instala drivers automáticamente.' -ForegroundColor Yellow
+        if (-not (Confirmar '¿Volver a permitir que Windows Update instale drivers?')) { return $false }
+        try {
+            Remove-ItemProperty -Path $politica -Name 'ExcludeWUDriversInQualityUpdate' -ErrorAction SilentlyContinue
+            if (-not (Test-Path -Path $busqueda)) { New-Item -Path $busqueda -Force | Out-Null }
+            Set-ItemProperty -Path $busqueda -Name 'SearchOrderConfig' -Value 1 -Type DWord -ErrorAction Stop
+            Write-Log 'Windows Update puede volver a instalar drivers.' 'OK'
+            return $true
+        }
+        catch { Write-Log "No se pudo cambiar: $($_.Exception.Message)" 'ERROR'; return $false }
+    }
+    Write-Host '    Estado actual: Windows Update instala drivers automáticamente.' -ForegroundColor Cyan
+    Write-Host '    Bloquearlo sirve cuando Windows reinstala una y otra vez un driver que falla.' -ForegroundColor DarkGray
+    Write-Host '    Desventaja: los drivers ya no se actualizan solos (hay que hacerlo a mano o con la herramienta del fabricante).' -ForegroundColor DarkGray
+    if (-not (Confirmar '¿Bloquear la instalación automática de drivers por Windows Update?')) { return $false }
+    try {
+        if (-not (Test-Path -Path $politica)) { New-Item -Path $politica -Force | Out-Null }
+        Set-ItemProperty -Path $politica -Name 'ExcludeWUDriversInQualityUpdate' -Value 1 -Type DWord -ErrorAction Stop
+        if (-not (Test-Path -Path $busqueda)) { New-Item -Path $busqueda -Force | Out-Null }
+        Set-ItemProperty -Path $busqueda -Name 'SearchOrderConfig' -Value 0 -Type DWord -ErrorAction Stop
+        Write-Log 'Bloqueado: Windows Update ya no instalará drivers automáticamente. Se puede revertir desde esta misma opción.' 'OK'
+        return $true
+    }
+    catch {
+        Write-Log "No se pudo bloquear: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+}
+
+function Abrir-PaginaFabricante {
+    Mostrar-Titulo 'PÁGINA DE DRIVERS DEL FABRICANTE'
+    $f = Get-InfoFabricante
+    Write-Host ("    Marca: {0}" -f $f.Marca) -ForegroundColor White
+    Write-Host ("    Modelo: {0}" -f $f.Modelo) -ForegroundColor White
+    Write-Host ("    Número de serie: {0}" -f $f.Serie) -ForegroundColor White
+    if ($f.Generico) { Write-Host '    Es una PC armada: se muestra la placa madre (los drivers se descargan de su fabricante).' -ForegroundColor DarkGray }
+    if ($f.Herramientas.Count -gt 0) {
+        Write-Host ("    Herramientas del fabricante instaladas: {0}" -f ($f.Herramientas -join ', ')) -ForegroundColor Green
+        Write-Host '    Ábrala y use "Buscar actualizaciones": instala los drivers exactos del modelo.' -ForegroundColor DarkGray
+    }
+    try { if ($f.Serie) { Set-Clipboard -Value $f.Serie; Write-Log 'Número de serie copiado al portapapeles (péguelo en la página del fabricante).' 'INFO' } } catch { }
+    if (-not $f.Url) {
+        Write-Log 'No se conoce la página de este fabricante: busque "<marca> <modelo> drivers" en el navegador.' 'ADVERTENCIA'
+        return $false
+    }
+    Write-Log "Página de drivers: $($f.Url)" 'INFO'
+    Write-Host '    Consejos: descargue chipset, video, red/WiFi, audio y Bluetooth, en ese orden.' -ForegroundColor DarkGray
+    Write-Host '    Si una CPU es Intel, también sirve "Intel Driver & Support Assistant"; para video AMD/NVIDIA, sus propias apps.' -ForegroundColor DarkGray
+    if (Confirmar '¿Abrir la página de drivers en el navegador?') {
+        return (Start-ComoUsuario -Programa $f.Url)
+    }
+    return $true
+}
+
+#endregion
+
 #region ==================== CATÁLOGO DE ACCIONES ====================
 
 # Lista única de acciones: la usan la interfaz gráfica (tarjetas por categoría) y el submenú de consola.
@@ -3968,6 +4542,14 @@ $Script:Catalogo = @(
     @{ Cat = 'Sistema'; Titulo = 'Microsoft Store y apps'; Desc = 'Limpia la caché de la Store y la vuelve a registrar.'; Cmd = 'Reparar-Store' }
     @{ Cat = 'Sistema'; Titulo = 'Sincronizar fecha y hora'; Desc = 'La hora mal causa errores de certificados y de inicio de sesión.'; Cmd = 'Sincronizar-Hora' }
     @{ Cat = 'Sistema'; Titulo = 'Crear punto de restauración'; Desc = 'Recomendado antes de cualquier cambio grande.'; Cmd = 'New-PuntoRestauracion' }
+
+    @{ Cat = 'Drivers'; Titulo = 'Buscar drivers en Windows Update'; Desc = 'Lista los drivers disponibles para este equipo y marca cuáles corrigen un dispositivo con problema.'; Cmd = 'Buscar-DriversWindowsUpdate'; Avanzada = $true }
+    @{ Cat = 'Drivers'; Titulo = 'Página de drivers del fabricante'; Desc = 'Detecta marca, modelo y serie, y abre la página de soporte del equipo.'; Cmd = 'Abrir-PaginaFabricante'; Avanzada = $true }
+    @{ Cat = 'Drivers'; Titulo = 'Respaldar todos los drivers'; Desc = 'Copia los drivers a una carpeta o USB. Ideal antes de formatear.'; Cmd = 'Respaldar-Drivers'; Avanzada = $true }
+    @{ Cat = 'Drivers'; Titulo = 'Restaurar o instalar drivers desde carpeta/USB'; Desc = 'Instala un respaldo o drivers (.inf) descargados del fabricante.'; Cmd = 'Instalar-DriversCarpeta'; Avanzada = $true }
+    @{ Cat = 'Drivers'; Titulo = 'Reinstalar un dispositivo'; Desc = 'Lo quita y Windows lo vuelve a detectar con su driver.'; Cmd = 'Reinstalar-Dispositivo'; Avanzada = $true }
+    @{ Cat = 'Drivers'; Titulo = 'Revertir el driver'; Desc = 'Vuelve a la versión anterior si una actualización lo rompió.'; Aviso = 'Crea punto de restauración'; Cmd = 'Revertir-Driver'; Avanzada = $true }
+    @{ Cat = 'Drivers'; Titulo = 'Bloquear drivers de Windows Update'; Desc = 'Activa o desactiva que Windows instale drivers solo (cuando reinstala uno que falla).'; Cmd = 'Cambiar-BloqueoDriversWU'; Avanzada = $true }
 
     @{ Cat = 'Red e internet'; Titulo = 'Reparar red (completo)'; Desc = 'DNS, IP, Winsock y TCP/IP. Requiere reiniciar.'; Aviso = 'Corta AnyDesk / TeamViewer'; Cmd = 'Reparar-Red' }
     @{ Cat = 'Red e internet'; Titulo = 'Reparar red (suave)'; Desc = 'DNS, Winsock y TCP/IP sin cortar la conexión. Requiere reiniciar.'; Cmd = 'Reparar-Red -Suave' }
@@ -4284,6 +4866,7 @@ $Script:XamlDialogo = @'
 $Script:CategoriasGui = [ordered]@{
     'Inicio'                = @{ Icono = 0xE80F; Desc = '' }
     'Sistema'               = @{ Icono = 0xE770; Desc = 'Archivos de Windows, actualizaciones, disco, rendimiento y menú Inicio.' }
+    'Drivers'               = @{ Icono = 0xE772; Desc = 'Identificar dispositivos desconocidos, instalar, respaldar, reinstalar y revertir drivers.' }
     'Red e internet'        = @{ Icono = 0xE701; Desc = 'Conexión, DNS, proxy, archivo hosts y navegadores.' }
     'Sonido y dispositivos' = @{ Icono = 0xE767; Desc = 'Audio, micrófono, cámara, Bluetooth, USB, impresoras y batería.' }
     'Outlook y Office'      = @{ Icono = 0xE715; Desc = 'Outlook, Office, OneDrive y Teams.' }
@@ -4903,7 +5486,7 @@ function Mostrar-Menu {
     Write-Host '    10. Sincronizar fecha y hora'
     Write-Host '    15. Diagnosticar y reparar SONIDO' -ForegroundColor Green
     Write-Host '    16. Outlook / Office (caché, contraseña, OST, reparar Office)' -ForegroundColor Green
-    Write-Host '    17. Reparaciones avanzadas (Inicio, micrófono, Bluetooth, navegadores, antivirus...)' -ForegroundColor Green
+    Write-Host '    17. Reparaciones avanzadas (drivers, Inicio, micrófono, Bluetooth, navegadores, antivirus...)' -ForegroundColor Green
     Write-Host '   OTROS' -ForegroundColor Cyan
     Write-Host '    11. Crear punto de restauración'
     Write-Host '    12. Reporte de batería (laptops)'
