@@ -167,4 +167,6 @@ Si existe `icon.ico` en la raíz, se usa como icono. La versión sale de `$Scrip
 
 ## Licencia
 
-[MIT](LICENSE) © 2026 Alexander Salazar. Se entrega "tal cual", sin garantía: úsela bajo su responsabilidad y cree un punto de restauración antes de reparar.
+© 2026 Alexander Salazar. **Todos los derechos reservados.** Software propietario: no se permite usarlo, copiarlo, modificarlo ni distribuirlo sin autorización por escrito del autor. Vea [LICENSE](LICENSE).
+
+Se entrega "tal cual", sin garantía: cree un punto de restauración antes de reparar.
