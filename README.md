@@ -1,6 +1,6 @@
-# Soporte Técnico para Windows 10/11 (v2.3)
+# Soporte Técnico para Windows 10/11 (v2.4)
 
-> **Estado: en desarrollo.** La versión 2.3 todavía no se ha probado en un equipo Windows real. Úsela primero en un equipo de prueba.
+> **Estado: en desarrollo.** La versión 2.4 todavía no se ha probado en un equipo Windows real. Úsela primero en un equipo de prueba.
 
 Herramienta portable para técnicos de soporte. Diagnostica el equipo, le pone un puntaje de salud, sugiere qué reparar y aplica las reparaciones. Todo lo que hace queda registrado en un log.
 
@@ -107,7 +107,17 @@ Además se guarda la **ficha del equipo**. Solo datos de identificación, **nunc
 | `Clientes\<equipo>\Ficha_equipo.txt` | Ficha del equipo de la última visita |
 | `Clientes\<equipo>\Programas_<fecha>.csv` | Programas instalados ese día (útil antes de formatear) |
 
-Si la herramienta no corre desde una USB, el historial queda en `C:\SoporteTecnico\Historial.csv`. Si el `Historial.csv` está abierto en Excel, no se puede actualizar: ciérrelo antes de terminar la visita.
+### Trabajo remoto (sin la USB)
+
+Cuando atiende por AnyDesk o TeamViewer, la herramienta corre en el equipo del cliente y no en su USB. Para que esas visitas también lleguen a su historial:
+
+1. **Al cerrar** la herramienta, la visita se exporta sola a `C:\SoporteTecnico\Exportar\Visita_<equipo>_<fecha>.zip` y se abre esa carpeta. El `.zip` lleva las visitas de ese equipo, su ficha, la lista de programas, el log y los reportes de la sesión. No lleva los respaldos de drivers, porque pesan demasiado.
+2. **Copie el `.zip`** a su PC con la transferencia de archivos de AnyDesk o TeamViewer.
+3. **Póngalo en la USB**, en `Clientes\Importar\`. La próxima vez que abra la herramienta desde la USB, se carga sola en el historial y en la carpeta del equipo. Los ya cargados se mueven a `Clientes\Importar\Importados\`.
+
+También puede usar **Herramientas > Importar visitas remotas** para cargar un `.zip` o una carpeta en cualquier momento, y **Herramientas > Exportar esta visita** para generar el `.zip` sin cerrar. La misma visita no se duplica aunque la importe dos veces.
+
+En el equipo del cliente, el historial de sus propias visitas queda en `C:\SoporteTecnico\Historial.csv`. Si el `Historial.csv` está abierto en Excel, no se puede actualizar: ciérrelo antes de terminar la visita.
 
 ## Usuario del cliente y usuario administrador
 

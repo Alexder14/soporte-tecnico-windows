@@ -16,7 +16,7 @@ $Script:FuncionesIniciales = @(Get-ChildItem -Path function: | ForEach-Object { 
 $Script:ModoInterfaz = 'Grafica'
 if ($Consola) { $Script:ModoInterfaz = 'Consola' }
 
-$Script:Version = '2.3'
+$Script:Version = '2.4'
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -4735,6 +4735,8 @@ $Script:Catalogo = @(
     @{ Cat = 'Herramientas'; Titulo = 'Servicios'; Desc = 'Servicios de Windows.'; Cmd = "Abrir-Herramienta 'services'"; Ui = $true }
     @{ Cat = 'Herramientas'; Titulo = 'Carpeta de reportes'; Desc = 'Diagnósticos, respaldos y reportes.'; Cmd = "Abrir-Herramienta 'reportes'"; Ui = $true }
     @{ Cat = 'Herramientas'; Titulo = 'Abrir el log de esta sesión'; Desc = 'Todo lo que hizo la herramienta.'; Cmd = "Abrir-Herramienta 'log'"; Ui = $true }
+    @{ Cat = 'Herramientas'; Titulo = 'Exportar esta visita'; Desc = 'Trabajo remoto: guarda la visita en un .zip para cargarlo después en su USB (se hace solo al cerrar si no está en la USB).'; Cmd = 'Exportar-Visita'; Avanzada = $true }
+    @{ Cat = 'Herramientas'; Titulo = 'Importar visitas remotas'; Desc = 'Carga en el historial de la USB los .zip de visitas hechas sin la USB.'; Cmd = 'Importar-Visitas'; Avanzada = $true }
 )
 
 function Mostrar-Avanzadas {
@@ -4792,12 +4794,12 @@ function Test-SerieValida {
 
 function Test-MismoEquipo {
     # Mismo equipo: por número de serie si es real; por nombre solo si alguna de las dos series es de relleno.
-    param($Fila, [string]$Serie)
+    param($Fila, [string]$Serie, [string]$Equipo = $env:COMPUTERNAME)
     if (Test-SerieValida $Serie) {
         if ($Fila.Serie -eq $Serie) { return $true }
-        return ((-not (Test-SerieValida $Fila.Serie)) -and $Fila.Equipo -eq $env:COMPUTERNAME)
+        return ((-not (Test-SerieValida $Fila.Serie)) -and $Fila.Equipo -eq $Equipo)
     }
-    return ($Fila.Equipo -eq $env:COMPUTERNAME)
+    return ($Fila.Equipo -eq $Equipo)
 }
 
 function Iniciar-Visita {
@@ -5068,19 +5070,7 @@ function Guardar-Visita {
         Move-Item -LiteralPath $tmp -Destination $ruta -Force -ErrorAction Stop
 
         # 2. Historial de este equipo, legible
-        $propias = @($filas | Where-Object { Test-MismoEquipo $_ $v.Serie })
-        $lineas = New-Object System.Collections.Generic.List[string]
-        $lineas.Add(('HISTORIAL DE VISITAS - {0} {1} (serie {2})' -f $fila.Marca, $fila.Modelo, $fila.Serie))
-        $lineas.Add(('=' * 60))
-        foreach ($p in $propias) {
-            $lineas.Add('')
-            $lineas.Add(('{0} a {1} | Equipo: {2} | Cliente: {3}' -f $p.Fecha, $p.Hasta, $p.Equipo, $p.Cliente))
-            if ($p.Usuario) { $lineas.Add(('   Usuario: {0} {1} {2}' -f $p.Usuario, $p.NombreCompleto, $p.Cuenta)) }
-            if ($p.PuntajeAntes) { $lineas.Add(('   Puntaje: {0} -> {1}' -f $p.PuntajeAntes, $p.PuntajeDespues)) }
-            foreach ($a in @("$($p.Acciones)" -split '; ' | Where-Object { $_ })) { $lineas.Add(('   - {0}' -f $a)) }
-            if ($p.Notas) { $lineas.Add(('   Notas: {0}' -f $p.Notas)) }
-        }
-        [System.IO.File]::WriteAllLines((Join-Path $Script:Base 'Historial.txt'), $lineas, (New-Object System.Text.UTF8Encoding($true)))
+        Escribir-HistorialEquipo -Filas $filas -Serie $v.Serie -Equipo $env:COMPUTERNAME -Carpeta $Script:Base
     }
     catch {
         Write-Log ("No se pudo guardar el historial de visitas (¿está abierto en Excel?): {0}" -f $_.Exception.Message) 'ADVERTENCIA' -SoloArchivo
@@ -5111,6 +5101,191 @@ function Test-VisitaConActividad {
 
 #endregion
 
+function Escribir-HistorialEquipo {
+    # Genera <carpeta del equipo>\Historial.txt con todas las visitas de ese equipo.
+    param($Filas, [string]$Serie, [string]$Equipo, [string]$Carpeta)
+    $propias = @($Filas | Where-Object { Test-MismoEquipo $_ $Serie $Equipo })
+    if ($propias.Count -eq 0) { return }
+    $ultima = $propias[$propias.Count - 1]
+    $lineas = New-Object System.Collections.Generic.List[string]
+    $lineas.Add(('HISTORIAL DE VISITAS - {0} {1} (serie {2})' -f $ultima.Marca, $ultima.Modelo, $ultima.Serie))
+    $lineas.Add(('=' * 60))
+    foreach ($p in $propias) {
+        $lineas.Add('')
+        $lineas.Add(('{0} a {1} | Equipo: {2} | Cliente: {3}' -f $p.Fecha, $p.Hasta, $p.Equipo, $p.Cliente))
+        if ($p.Usuario) { $lineas.Add(('   Usuario: {0} {1} {2}' -f $p.Usuario, $p.NombreCompleto, $p.Cuenta)) }
+        if ($p.PuntajeAntes) { $lineas.Add(('   Puntaje: {0} -> {1}' -f $p.PuntajeAntes, $p.PuntajeDespues)) }
+        foreach ($a in @("$($p.Acciones)" -split '; ' | Where-Object { $_ })) { $lineas.Add(('   - {0}' -f $a)) }
+        if ($p.Notas) { $lineas.Add(('   Notas: {0}' -f $p.Notas)) }
+    }
+    if (-not (Test-Path -LiteralPath $Carpeta)) { New-Item -ItemType Directory -Path $Carpeta -Force | Out-Null }
+    [System.IO.File]::WriteAllLines((Join-Path $Carpeta 'Historial.txt'), $lineas, (New-Object System.Text.UTF8Encoding($true)))
+}
+
+function Exportar-Visita {
+    # Para el trabajo remoto (sin la USB): empaqueta en un .zip las visitas de este equipo, su ficha,
+    # sus programas y los logs y reportes de esta sesión. Luego se carga en la USB con "Importar visitas".
+    $ruta = Get-RutaHistorialGeneral
+    if (-not (Test-Path -LiteralPath $ruta)) { Write-Log 'Todavía no hay visitas que exportar.' 'INFO'; return $null }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $dirExportar = Join-Path $Script:BaseLocal 'Exportar'
+    $preparacion = Join-Path $env:TEMP ('soporte_export_{0}' -f [guid]::NewGuid().ToString('N'))
+    try {
+        if (-not (Test-Path -LiteralPath $dirExportar)) { New-Item -ItemType Directory -Path $dirExportar -Force | Out-Null }
+        $dirEquipo = Join-Path $preparacion 'Equipo'
+        New-Item -ItemType Directory -Path (Join-Path $dirEquipo 'Logs') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $dirEquipo 'Reportes') -Force | Out-Null
+
+        # Todas las visitas de este equipo (así también viajan las de una sesión anterior que no se exportó)
+        $serie = "$($Sync.Visita.Serie)"
+        $filas = @(Import-Csv -LiteralPath $ruta -Encoding UTF8 -ErrorAction Stop | Where-Object { Test-MismoEquipo $_ $serie })
+        if ($filas.Count -eq 0) { Write-Log 'No hay visitas de este equipo que exportar.' 'INFO'; return $null }
+        $filas | Export-Csv -LiteralPath (Join-Path $preparacion 'visitas.csv') -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+
+        # Ficha, programas y lo generado en esta sesión (no los respaldos de drivers: pesan demasiado)
+        $desde = $Sync.Visita.Inicio.AddMinutes(-1)
+        foreach ($f in @(Get-ChildItem -LiteralPath $Script:Base -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'Ficha_equipo.txt' -or $_.Name -like 'Programas_*.csv' })) {
+            Copy-Item -LiteralPath $f.FullName -Destination $dirEquipo -Force
+        }
+        if (Test-Path -LiteralPath $Script:LogFile) { Copy-Item -LiteralPath $Script:LogFile -Destination (Join-Path $dirEquipo 'Logs') -Force }
+        foreach ($f in @(Get-ChildItem -LiteralPath $Script:DirReportes -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $desde -and $_.Length -lt 50MB })) {
+            Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $dirEquipo 'Reportes') -Force
+        }
+        Set-Content -LiteralPath (Join-Path $preparacion 'equipo.txt') -Value $env:COMPUTERNAME -Encoding UTF8
+
+        $zip = Join-Path $dirExportar ('Visita_{0}_{1}.zip' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmm'))
+        if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($preparacion, $zip)
+        Write-Log ("Visita exportada: {0}" -f $zip) 'OK'
+        Write-Log 'Copie ese archivo a su USB, en Clientes\Importar, o use "Importar visitas remotas".' 'INFO'
+        return $zip
+    }
+    catch {
+        Write-Log "No se pudo exportar la visita: $($_.Exception.Message)" 'ERROR'
+        return $null
+    }
+    finally {
+        Remove-Item -LiteralPath $preparacion -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Importar-ArchivoVisita {
+    # Carga un .zip de Exportar-Visita en el historial y en la carpeta del equipo. Devuelve cuántas visitas agregó.
+    param([string]$Zip)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $temp = Join-Path $env:TEMP ('soporte_import_{0}' -f [guid]::NewGuid().ToString('N'))
+    try {
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($Zip, $temp)
+        $csv = Join-Path $temp 'visitas.csv'
+        if (-not (Test-Path -LiteralPath $csv)) { throw 'no es un archivo de visita de esta herramienta (falta visitas.csv)' }
+        $nuevas = @(Import-Csv -LiteralPath $csv -Encoding UTF8 -ErrorAction Stop | Where-Object { $_.Id })
+        if ($nuevas.Count -eq 0) { throw 'el archivo no tiene visitas' }
+
+        # 1. Unir al historial general sin duplicar (la misma visita puede venir en varios .zip)
+        $ruta = Get-RutaHistorialGeneral
+        $filas = New-Object System.Collections.Generic.List[object]
+        if (Test-Path -LiteralPath $ruta) { foreach ($x in @(Import-Csv -LiteralPath $ruta -Encoding UTF8 -ErrorAction Stop)) { $filas.Add($x) } }
+        $ids = @{}
+        for ($i = 0; $i -lt $filas.Count; $i++) { $ids["$($filas[$i].Id)"] = $i }
+        $agregadas = 0
+        foreach ($n in $nuevas) {
+            if ($ids.ContainsKey("$($n.Id)")) { $filas[$ids["$($n.Id)"]] = $n }
+            else { $filas.Add($n); $agregadas++ }
+        }
+        $columnas = New-Object System.Collections.Generic.List[string]
+        foreach ($x in $filas) { foreach ($c in $x.PSObject.Properties.Name) { if (-not $columnas.Contains($c)) { $columnas.Add($c) } } }
+        $ordenadas = @($filas | Sort-Object -Property @{ e = { $d = [datetime]::MinValue; [void][datetime]::TryParseExact("$($_.Fecha)", 'dd/MM/yyyy HH:mm', $null, 'None', [ref]$d); $d } })
+        $tmp = "$ruta.tmp"
+        $ordenadas | Select-Object -Property @($columnas) | Export-Csv -LiteralPath $tmp -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $tmp -Destination $ruta -Force -ErrorAction Stop
+
+        # 2. Archivos del equipo a su carpeta de clientes
+        $ultima = $nuevas[$nuevas.Count - 1]
+        $equipo = "$($ultima.Equipo)" -replace '[\\/:*?"<>|]', '_'
+        if (-not $equipo) { $equipo = 'Equipo_desconocido' }
+        $carpeta = Join-Path (Split-Path -Parent $ruta) (Join-Path 'Clientes' $equipo)
+        if ($Script:EnUsb) { $carpeta = Join-Path (Split-Path -Parent $ruta) $equipo }
+        $origen = Join-Path $temp 'Equipo'
+        if (Test-Path -LiteralPath $origen) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $origen -Recurse -File -ErrorAction SilentlyContinue)) {
+                $relativa = $f.FullName.Substring($origen.Length).TrimStart('\')
+                $destino = Join-Path $carpeta $relativa
+                $dirDestino = Split-Path -Parent $destino
+                if (-not (Test-Path -LiteralPath $dirDestino)) { New-Item -ItemType Directory -Path $dirDestino -Force | Out-Null }
+                Copy-Item -LiteralPath $f.FullName -Destination $destino -Force
+            }
+        }
+        Escribir-HistorialEquipo -Filas $ordenadas -Serie "$($ultima.Serie)" -Equipo "$($ultima.Equipo)" -Carpeta $carpeta
+        Write-Log ("Importado {0}: {1} visita(s) nueva(s) de {2}" -f (Split-Path -Leaf $Zip), $agregadas, $ultima.Equipo) 'OK'
+        return $agregadas
+    }
+    finally {
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-DirImportar {
+    return (Join-Path (Split-Path -Parent (Get-RutaHistorialGeneral)) 'Importar')
+}
+
+function Importar-Visitas {
+    # Carga los .zip exportados en equipos atendidos de forma remota.
+    param([switch]$Automatico)
+    $dirImportar = Get-DirImportar
+    if (-not $Automatico) {
+        Mostrar-Titulo 'IMPORTAR VISITAS REMOTAS'
+        if (-not $Script:EnUsb) {
+            Write-Log 'La herramienta no se abrió desde la USB: las visitas se importarán al historial de este equipo, no al de la USB.' 'ADVERTENCIA'
+        }
+        Write-Host ('    Cargue aquí los archivos Visita_<equipo>_<fecha>.zip que la herramienta genera al trabajar sin la USB.') -ForegroundColor DarkGray
+        Write-Host ('    También puede dejarlos en {0}: se cargan solos al abrir la herramienta.' -f $dirImportar) -ForegroundColor DarkGray
+        $resp = Read-Host ('  Archivo .zip o carpeta con los .zip (vacío = {0})' -f $dirImportar)
+        if ($Script:ModoInterfaz -eq 'Grafica' -and $Sync.Cancelado) { Write-Log 'Operación cancelada.' 'INFO'; return $false }
+        $origen = "$resp".Trim().Trim('"')
+        if (-not $origen) { $origen = $dirImportar }
+    }
+    else {
+        $origen = $dirImportar
+    }
+    if (-not (Test-Path -LiteralPath $origen)) {
+        if (-not $Automatico) { Write-Log "No existe: $origen" 'ERROR' }
+        return $false
+    }
+    if (Test-Path -LiteralPath $origen -PathType Leaf) { $zips = @(Get-Item -LiteralPath $origen) }
+    else { $zips = @(Get-ChildItem -LiteralPath $origen -Filter 'Visita_*.zip' -File -ErrorAction SilentlyContinue | Sort-Object -Property Name) }
+    if ($zips.Count -eq 0) {
+        if (-not $Automatico) { Write-Log 'No se encontraron archivos Visita_*.zip.' 'INFO' }
+        return $false
+    }
+    $total = 0
+    $fallos = 0
+    $importados = Join-Path $dirImportar 'Importados'
+    foreach ($z in $zips) {
+        try {
+            $total += [int](Importar-ArchivoVisita $z.FullName)
+            # Ya cargado: se mueve para no volver a procesarlo
+            if ($z.DirectoryName -eq $dirImportar) {
+                if (-not (Test-Path -LiteralPath $importados)) { New-Item -ItemType Directory -Path $importados -Force | Out-Null }
+                Move-Item -LiteralPath $z.FullName -Destination (Join-Path $importados $z.Name) -Force -ErrorAction SilentlyContinue
+            }
+        }
+        catch {
+            $fallos++
+            Write-Log ("No se pudo importar {0}: {1}" -f $z.Name, $_.Exception.Message) 'ERROR'
+        }
+    }
+    Write-Log ("Importación terminada: {0} archivo(s), {1} visita(s) nueva(s), {2} con error." -f $zips.Count, $total, $fallos) 'INFO'
+    return ($fallos -eq 0)
+}
+
+function Finalizar-VisitaRemota {
+    # Al cerrar sin la USB: exporta la visita y abre la carpeta para copiar el .zip por AnyDesk/TeamViewer.
+    if ($Script:EnUsb) { return $null }
+    $zip = Exportar-Visita
+    if ($zip) { try { Abrir-ParaUsuario (Split-Path -Parent $zip) } catch { } }
+    return $zip
+}
+
 function Invoke-Registrada {
     # Ejecuta una acción de un submenú de consola y la anota en la visita.
     param([string]$Titulo, [scriptblock]$Accion)
@@ -5129,6 +5304,7 @@ function Invoke-Registrada {
 function Iniciar-VisitaGui {
     # Después de entrar: avisa si el equipo ya se atendió antes y recopila su ficha en segundo plano.
     $Script:Gui.AccesoOk = $true
+    if ($Script:EnUsb) { try { $null = Importar-Visitas -Automatico } catch { } }
     try { Iniciar-Visita } catch { }
     if ($Sync.Visita.AvisoAnterior) { Write-Host ('HISTORIAL: ' + $Sync.Visita.AvisoAnterior) -ForegroundColor Yellow }
     # La ficha se arma en segundo plano, en un runspace propio, para no bloquear los botones
@@ -5968,6 +6144,10 @@ function Iniciar-InterfazGrafica {
                     $cliente = Mostrar-DialogoGui @{ Tipo = 'Texto'; Texto = 'Historial de la visita: nombre del cliente (opcional).'; Valor = $Script:Sync.Visita.ClienteAnterior }
                     $notas = Mostrar-DialogoGui @{ Tipo = 'Texto'; Texto = 'Historial de la visita: notas, por ejemplo qué problema tenía (opcional).' }
                     Cerrar-Visita -Cliente $cliente -Notas $notas
+                    $zip = Finalizar-VisitaRemota
+                    if ($zip) {
+                        [void](Mostrar-DialogoGui @{ Tipo = 'Info'; Titulo = 'Visita exportada'; Texto = ("No está trabajando desde la USB, así que la visita se guardó en:`n{0}`n`nCópielo a su USB, en la carpeta Clientes\Importar (por ejemplo con la transferencia de archivos de AnyDesk). Se carga solo la próxima vez que abra la herramienta desde la USB." -f $zip) })
+                    }
                 }
             }
             catch { Write-Log ("No se pudo cerrar la visita: {0}" -f $_.Exception.Message) 'ADVERTENCIA' -SoloArchivo }
@@ -6090,6 +6270,7 @@ if ($Script:ModoInterfaz -eq 'Grafica') {
 
 if (-not (Test-Acceso)) { exit }
 
+if ($Script:EnUsb) { try { $null = Importar-Visitas -Automatico } catch { } }
 try { Iniciar-Visita } catch { }
 Write-Host '  Recopilando los datos del equipo...' -ForegroundColor DarkGray
 try { $null = Guardar-FichaEquipo } catch { Write-Log "No se pudo recopilar la ficha del equipo: $($_.Exception.Message)" 'ADVERTENCIA' -SoloArchivo }
@@ -6143,6 +6324,15 @@ if (Test-VisitaConActividad) {
     $notas = Read-Host '  Notas, por ejemplo qué problema tenía (opcional)'
     try { Cerrar-Visita -Cliente $cliente -Notas $notas } catch { }
     Write-Host ("  Historial guardado en: {0}" -f (Get-RutaHistorialGeneral)) -ForegroundColor Cyan
+    $zip = $null
+    try { $zip = Finalizar-VisitaRemota } catch { }
+    if ($zip) {
+        Write-Host ''
+        Write-Host '  No está trabajando desde la USB. La visita se exportó a:' -ForegroundColor Yellow
+        Write-Host ("    {0}" -f $zip) -ForegroundColor Yellow
+        Write-Host '  Cópielo a su USB en Clientes\Importar: se carga solo al abrir la herramienta desde la USB.' -ForegroundColor Yellow
+        Read-Host '  Presione Enter para salir'
+    }
 }
 Write-Log 'Fin de la sesión de Soporte Técnico.' 'INFO' -SoloArchivo
 Write-Host ''
