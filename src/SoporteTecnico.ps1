@@ -4790,6 +4790,16 @@ function Test-SerieValida {
     return $true
 }
 
+function Test-MismoEquipo {
+    # Mismo equipo: por número de serie si es real; por nombre solo si alguna de las dos series es de relleno.
+    param($Fila, [string]$Serie)
+    if (Test-SerieValida $Serie) {
+        if ($Fila.Serie -eq $Serie) { return $true }
+        return ((-not (Test-SerieValida $Fila.Serie)) -and $Fila.Equipo -eq $env:COMPUTERNAME)
+    }
+    return ($Fila.Equipo -eq $env:COMPUTERNAME)
+}
+
 function Iniciar-Visita {
     # Prepara la visita actual y busca visitas anteriores a este equipo.
     $v = $Sync.Visita
@@ -4804,10 +4814,7 @@ function Iniciar-Visita {
     $ruta = Get-RutaHistorialGeneral
     if (-not (Test-Path -LiteralPath $ruta)) { return }
     try {
-        $serieValida = Test-SerieValida $serie
-        $anteriores = @(Import-Csv -LiteralPath $ruta -Encoding UTF8 -ErrorAction Stop | Where-Object {
-                ($serieValida -and $_.Serie -eq $serie) -or ($_.Equipo -eq $env:COMPUTERNAME)
-            })
+        $anteriores = @(Import-Csv -LiteralPath $ruta -Encoding UTF8 -ErrorAction Stop | Where-Object { Test-MismoEquipo $_ $serie })
         if ($anteriores.Count -eq 0) { return }
         $ultima = $anteriores[$anteriores.Count - 1]
         $v.ClienteAnterior = "$($ultima.Cliente)"
@@ -5061,8 +5068,7 @@ function Guardar-Visita {
         Move-Item -LiteralPath $tmp -Destination $ruta -Force -ErrorAction Stop
 
         # 2. Historial de este equipo, legible
-        $serieValida = Test-SerieValida $v.Serie
-        $propias = @($filas | Where-Object { ($serieValida -and $_.Serie -eq $v.Serie) -or $_.Equipo -eq $env:COMPUTERNAME })
+        $propias = @($filas | Where-Object { Test-MismoEquipo $_ $v.Serie })
         $lineas = New-Object System.Collections.Generic.List[string]
         $lineas.Add(('HISTORIAL DE VISITAS - {0} {1} (serie {2})' -f $fila.Marca, $fila.Modelo, $fila.Serie))
         $lineas.Add(('=' * 60))
@@ -5125,7 +5131,16 @@ function Iniciar-VisitaGui {
     $Script:Gui.AccesoOk = $true
     try { Iniciar-Visita } catch { }
     if ($Sync.Visita.AvisoAnterior) { Write-Host ('HISTORIAL: ' + $Sync.Visita.AvisoAnterior) -ForegroundColor Yellow }
-    Ejecutar-TareaGui -Titulo 'Datos del equipo' -Comando 'Guardar-FichaEquipo'
+    # La ficha se arma en segundo plano, en un runspace propio, para no bloquear los botones
+    try {
+        $Script:Gui.RunspaceFicha = New-RunspaceGui
+        $ps = [powershell]::Create()
+        $ps.Runspace = $Script:Gui.RunspaceFicha
+        [void]$ps.AddScript('try { $null = Guardar-FichaEquipo } catch { Write-Log ("No se pudo recopilar la ficha del equipo: {0}" -f $_.Exception.Message) ''ADVERTENCIA'' -SoloArchivo }')
+        $Script:Gui.PsFicha = $ps
+        [void]$ps.BeginInvoke()
+    }
+    catch { Write-Log ("No se pudo iniciar la ficha del equipo: {0}" -f $_.Exception.Message) 'ADVERTENCIA' -SoloArchivo }
 }
 
 #region ==================== INTERFAZ GRÁFICA: DISEÑO (XAML) ====================
@@ -5401,8 +5416,11 @@ catch {
     $estado = 'Error'
     Write-Log ("Error inesperado en '{0}': {1}" -f $Titulo, $_.Exception.Message) 'ERROR'
 }
-$Sync.Visita.TareaActual = ''
-try { Registrar-AccionVisita $Titulo $estado } catch { }
+# Si la ventana ya la anotó como interrumpida al cerrar, TareaActual quedó vacío y no se repite
+if ($Sync.Visita.TareaActual -eq $Titulo) {
+    $Sync.Visita.TareaActual = ''
+    try { Registrar-AccionVisita $Titulo $estado } catch { }
+}
 try {
     if ($Script:RequiereReinicio) { Preguntar-Reinicio }
 }
@@ -5973,6 +5991,8 @@ function Iniciar-InterfazGrafica {
     $timer.Stop()
     try { if ($Script:Sync.PsActual) { $Script:Sync.PsActual.Stop() } } catch { }
     try { $Script:RunspaceGui.Dispose() } catch { }
+    try { if ($Script:Gui.PsFicha) { $Script:Gui.PsFicha.Stop(); $Script:Gui.PsFicha.Dispose() } } catch { }
+    try { if ($Script:Gui.RunspaceFicha) { $Script:Gui.RunspaceFicha.Dispose() } } catch { }
 }
 
 #endregion
