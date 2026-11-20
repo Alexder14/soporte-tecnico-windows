@@ -1,0 +1,13 @@
+# Ejecutables compilados: se publican en Releases, no en el código
+*.exe
+
+# Archivos temporales y de sistema
+*.tmp
+*.bak
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Logs y reportes si se generan dentro del proyecto
+Logs/
+Reportes/
