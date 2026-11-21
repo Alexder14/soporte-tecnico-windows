@@ -3861,7 +3861,7 @@ function Get-ProgramasInicio {
         if (-not $clave) { continue }
         foreach ($nombre in $clave.GetValueNames()) {
             if (-not $nombre) { continue }
-            $lista.Add([pscustomobject]@{ Nombre = $nombre; Comando = "$($clave.GetValue($nombre))"; Aprobado = $f.Aprobado; Ambito = $f.Ambito; Activo = (Test-InicioActivo $f.Aprobado $nombre) })
+            $lista.Add([pscustomobject]@{ Tipo = 'Registro'; Nombre = $nombre; Comando = "$($clave.GetValue($nombre))"; Aprobado = $f.Aprobado; Ambito = $f.Ambito; Activo = (Test-InicioActivo $f.Aprobado $nombre); RutaTarea = '' })
         }
     }
     $carpetas = @(
@@ -3870,9 +3870,23 @@ function Get-ProgramasInicio {
     )
     foreach ($c in $carpetas) {
         foreach ($a in @(Get-ChildItem -LiteralPath $c.Ruta -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'desktop.ini' })) {
-            $lista.Add([pscustomobject]@{ Nombre = $a.Name; Comando = $a.FullName; Aprobado = $c.Aprobado; Ambito = $c.Ambito; Activo = (Test-InicioActivo $c.Aprobado $a.Name) })
+            $lista.Add([pscustomobject]@{ Tipo = 'Carpeta'; Nombre = $a.Name; Comando = $a.FullName; Aprobado = $c.Aprobado; Ambito = $c.Ambito; Activo = (Test-InicioActivo $c.Aprobado $a.Name); RutaTarea = '' })
         }
     }
+    # Tareas programadas que se ejecutan al iniciar sesión o al arrancar (Adobe, Google Update, etc.).
+    # Se omiten las de Microsoft: son del sistema.
+    try {
+        foreach ($t in @(Get-ScheduledTask -ErrorAction Stop)) {
+            if ("$($t.TaskPath)" -like '\Microsoft\*') { continue }
+            $alInicio = $false
+            foreach ($g in @($t.Triggers)) { if ("$($g.CimClass.CimClassName)" -match 'LogonTrigger|BootTrigger') { $alInicio = $true } }
+            if (-not $alInicio) { continue }
+            $accion = @($t.Actions)[0]
+            $cmd = ("{0} {1}" -f $accion.Execute, $accion.Arguments).Trim()
+            $lista.Add([pscustomobject]@{ Tipo = 'Tarea'; Nombre = "$($t.TaskName)"; Comando = $cmd; Aprobado = ''; Ambito = 'tarea programada'; Activo = ("$($t.State)" -ne 'Disabled'); RutaTarea = "$($t.TaskPath)" })
+        }
+    }
+    catch { Write-Log ("No se pudieron leer las tareas programadas de inicio: {0}" -f $_.Exception.Message) 'ADVERTENCIA' -SoloArchivo }
     return $lista.ToArray()
 }
 
@@ -3880,9 +3894,14 @@ function Desactivar-ProgramaInicio {
     # Igual que "Deshabilitar" en Administrador de tareas > Inicio (reversible).
     param($Programa)
     try {
-        if (-not (Test-Path -Path $Programa.Aprobado)) { New-Item -Path $Programa.Aprobado -Force | Out-Null }
-        $bytes = [byte[]](3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-        New-ItemProperty -Path $Programa.Aprobado -Name $Programa.Nombre -Value $bytes -PropertyType Binary -Force -ErrorAction Stop | Out-Null
+        if ($Programa.Tipo -eq 'Tarea') {
+            Disable-ScheduledTask -TaskPath $Programa.RutaTarea -TaskName $Programa.Nombre -ErrorAction Stop | Out-Null
+        }
+        else {
+            if (-not (Test-Path -Path $Programa.Aprobado)) { New-Item -Path $Programa.Aprobado -Force | Out-Null }
+            $bytes = [byte[]](3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            New-ItemProperty -Path $Programa.Aprobado -Name $Programa.Nombre -Value $bytes -PropertyType Binary -Force -ErrorAction Stop | Out-Null
+        }
         Write-Log "Desactivado al inicio: $($Programa.Nombre)" 'OK'
         return $true
     }
@@ -3892,12 +3911,153 @@ function Desactivar-ProgramaInicio {
     }
 }
 
+function Activar-ProgramaInicio {
+    # Deshace Desactivar-ProgramaInicio (igual que "Habilitar" en Administrador de tareas > Inicio).
+    param($Programa)
+    try {
+        if ($Programa.Tipo -eq 'Tarea') {
+            Enable-ScheduledTask -TaskPath $Programa.RutaTarea -TaskName $Programa.Nombre -ErrorAction Stop | Out-Null
+        }
+        else {
+            if (-not (Test-Path -Path $Programa.Aprobado)) { New-Item -Path $Programa.Aprobado -Force | Out-Null }
+            $bytes = [byte[]](2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            New-ItemProperty -Path $Programa.Aprobado -Name $Programa.Nombre -Value $bytes -PropertyType Binary -Force -ErrorAction Stop | Out-Null
+        }
+        Write-Log "Activado al inicio: $($Programa.Nombre)" 'OK'
+        return $true
+    }
+    catch {
+        Write-Log "No se pudo activar $($Programa.Nombre): $($_.Exception.Message)" 'ADVERTENCIA'
+        return $false
+    }
+}
+
+$Script:XamlInicio = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Programas de inicio" Width="860" Height="680" MinWidth="680" MinHeight="460"
+        WindowStartupLocation="CenterOwner" Background="#0B1120" Foreground="#E2E8F0" FontFamily="Segoe UI" FontSize="13">
+  <Grid Margin="22">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <StackPanel Grid.Row="0">
+      <TextBlock Text="Programas de inicio" FontSize="22" FontWeight="SemiBold" Foreground="#F8FAFC"/>
+      <TextBlock x:Name="TxtResumen" Foreground="#94A3B8" Margin="0,4,0,12" TextWrapping="Wrap"/>
+    </StackPanel>
+    <Border Grid.Row="1" Background="#111827" CornerRadius="10" Padding="14,10" BorderBrush="#1F2937" BorderThickness="1" Margin="0,0,0,14">
+      <TextBlock x:Name="TxtArranque" Foreground="#CBD5E1" FontSize="12" TextWrapping="Wrap"/>
+    </Border>
+    <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+      <StackPanel x:Name="Lista" Margin="0,0,10,0"/>
+    </ScrollViewer>
+    <DockPanel Grid.Row="3" Margin="0,14,0,0">
+      <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+        <Button x:Name="BtnDesactivar" Content="Desactivar marcados" Margin="0,0,10,0"/>
+        <Button x:Name="BtnActivar" Content="Activar marcados" Margin="0,0,10,0"/>
+        <Button x:Name="BtnCerrar" Content="Cerrar"/>
+      </StackPanel>
+      <TextBlock x:Name="TxtMensaje" Foreground="#FACC15" VerticalAlignment="Center" TextWrapping="Wrap" Margin="0,0,14,0"/>
+    </DockPanel>
+  </Grid>
+</Window>
+'@
+
+function Cargar-InicioGui {
+    $g = $Script:InicioGui
+    $g.Lista.Children.Clear()
+    $items = @(Get-ProgramasInicio | Sort-Object -Property @{ Expression = { -not $_.Activo } }, Nombre)
+    $nAct = @($items | Where-Object { $_.Activo }).Count
+    $g.TxtResumen.Text = ("{0} elemento(s) de inicio, {1} activo(s). Marque los que quiera y pulse Desactivar o Activar. No se desinstala nada y todo se puede volver a activar. Los cambios se notan en el próximo inicio de sesión." -f $items.Count, $nAct)
+    foreach ($p in $items) {
+        $borde = New-Object System.Windows.Controls.Border
+        $borde.Background = Get-ColorPincel '#111827'
+        $borde.CornerRadius = New-Object System.Windows.CornerRadius(8)
+        $borde.Padding = New-Object System.Windows.Thickness(12, 9, 12, 9)
+        $borde.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+        $cb = New-Object System.Windows.Controls.CheckBox
+        $cb.Tag = $p
+        $cb.VerticalContentAlignment = [System.Windows.VerticalAlignment]::Top
+        $sp = New-Object System.Windows.Controls.StackPanel
+        $sp.Margin = New-Object System.Windows.Thickness(8, 0, 0, 0)
+        [void]$sp.Children.Add((Nuevo-TextoGui $p.Nombre 14 '#F1F5F9' -Negrita))
+        if ($p.Activo) { $estado = Nuevo-TextoGui ("Activo al iniciar · {0}" -f $p.Ambito) 12 '#4ADE80' }
+        else { $estado = Nuevo-TextoGui ("Desactivado · {0}" -f $p.Ambito) 12 '#94A3B8' }
+        [void]$sp.Children.Add($estado)
+        $cmd = Nuevo-TextoGui $p.Comando 11 '#64748B'
+        $cmd.TextTrimming = [System.Windows.TextTrimming]::CharacterEllipsis
+        $cmd.TextWrapping = [System.Windows.TextWrapping]::NoWrap
+        $cmd.ToolTip = $p.Comando
+        [void]$sp.Children.Add($cmd)
+        $cb.Content = $sp
+        $borde.Child = $cb
+        [void]$g.Lista.Children.Add($borde)
+    }
+    if ($items.Count -eq 0) { [void]$g.Lista.Children.Add((Nuevo-TextoGui 'No hay elementos de inicio.' 13 '#64748B')) }
+}
+
+function Aplicar-InicioGui {
+    # $Activar: $true = activar los marcados que están desactivados; $false = desactivar los marcados que están activos.
+    param([bool]$Activar)
+    $g = $Script:InicioGui
+    $hechos = 0
+    $fallos = 0
+    foreach ($b in @($g.Lista.Children)) {
+        $cb = $b.Child
+        if (-not ($cb -is [System.Windows.Controls.CheckBox]) -or -not $cb.IsChecked) { continue }
+        $p = $cb.Tag
+        if ($Activar -eq [bool]$p.Activo) { continue }
+        if ($Activar) { $ok = Activar-ProgramaInicio $p } else { $ok = Desactivar-ProgramaInicio $p }
+        if ($ok) { $hechos++ } else { $fallos++ }
+    }
+    Cargar-InicioGui
+    $verbo = 'desactivaron'
+    if ($Activar) { $verbo = 'activaron' }
+    if ($hechos -eq 0 -and $fallos -eq 0) { $g.TxtMensaje.Text = 'No hay nada marcado que cambiar.'; return }
+    $g.TxtMensaje.Text = ("Se {0} {1} elemento(s)." -f $verbo, $hechos)
+    if ($fallos -gt 0) { $g.TxtMensaje.Text += (" {0} no se pudieron cambiar (vea el registro)." -f $fallos) }
+    if ($hechos -gt 0) { try { Registrar-AccionVisita 'Programas de inicio' 'OK' } catch { } }
+}
+
+function Mostrar-InicioGui {
+    [xml]$x = $Script:XamlInicio
+    $w = [System.Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
+    $Script:InicioGui = @{ Ventana = $w }
+    foreach ($n in @('TxtResumen', 'TxtArranque', 'Lista', 'TxtMensaje', 'BtnDesactivar', 'BtnActivar', 'BtnCerrar')) { $Script:InicioGui[$n] = $w.FindName($n) }
+    try {
+        $Script:InicioGui.BtnDesactivar.Style = $Script:Gui.Ventana.FindResource('Primario')
+        $Script:InicioGui.BtnActivar.Style = $Script:Gui.Ventana.FindResource('Exito')
+        $Script:InicioGui.BtnCerrar.Style = $Script:Gui.Ventana.FindResource('Secundario')
+    }
+    catch { }
+    try { if ($Script:Gui.Ventana.IsLoaded) { $w.Owner = $Script:Gui.Ventana } } catch { }
+    $Script:InicioGui.TxtArranque.Text = 'Midiendo el arranque...'
+    try {
+        $est = Get-EstadoArranque
+        $Script:InicioGui.TxtArranque.Text = ((@($est.Lineas) | Select-Object -First 10) -join "`n")
+    }
+    catch { $Script:InicioGui.TxtArranque.Text = 'No se pudo leer el tiempo de arranque.' }
+    Cargar-InicioGui
+    $Script:InicioGui.BtnDesactivar.Add_Click({ Aplicar-InicioGui $false })
+    $Script:InicioGui.BtnActivar.Add_Click({ Aplicar-InicioGui $true })
+    $Script:InicioGui.BtnCerrar.Add_Click({ $Script:InicioGui.Ventana.Close() })
+    [void]$w.ShowDialog()
+}
+
 function Optimizar-Rendimiento {
     Mostrar-Titulo 'OPTIMIZAR RENDIMIENTO'
     $perfil = Get-PerfilUsuarioActivo
 
     $activos = @(Get-ProgramasInicio | Where-Object { $_.Activo })
-    if ($activos.Count -gt 0) {
+    if ($Script:ModoInterfaz -eq 'Grafica') {
+        # En la ventana: lista con casillas en vez de pedir números por escrito.
+        Write-Log 'Se abrió la ventana "Programas de inicio": marque lo que quiera desactivar y ciérrela para continuar.' 'INFO'
+        [void](Solicitar-Gui -Tipo 'Inicio' -Texto '')
+    }
+    elseif ($activos.Count -gt 0) {
         Write-Host '    Programas que arrancan con Windows:' -ForegroundColor Cyan
         for ($i = 0; $i -lt $activos.Count; $i++) {
             Write-Host ("    {0,2}. {1}  ({2})" -f ($i + 1), $activos[$i].Nombre, $activos[$i].Ambito)
@@ -4075,6 +4235,30 @@ function Get-IdentificacionHardware {
     return [pscustomobject]@{ Fabricante = $fabricante; Tipo = $tipo; Id = $idPrincipal; Texto = ('{0} - {1}' -f $fabricante, $tipo) }
 }
 
+function Get-EntradasDesinstalar {
+    # Lee las claves "Uninstall" una por una. Get-ItemProperty sobre "Uninstall\*" lanza "La conversión
+    # especificada no es válida" si UNA sola entrada tiene un valor mal formado (visto con NetBeans) y se
+    # pierde toda la lista. Aquí una entrada dañada se omite sin afectar a las demás.
+    param([string[]]$Rutas)
+    foreach ($ruta in $Rutas) {
+        $claves = @()
+        try { $claves = @(Get-ChildItem -Path $ruta -ErrorAction SilentlyContinue) } catch { }
+        foreach ($k in $claves) {
+            try {
+                [pscustomobject]@{
+                    DisplayName     = $k.GetValue('DisplayName')
+                    DisplayVersion  = $k.GetValue('DisplayVersion')
+                    Publisher       = $k.GetValue('Publisher')
+                    InstallDate     = $k.GetValue('InstallDate')
+                    SystemComponent = $k.GetValue('SystemComponent')
+                    ParentKeyName   = $k.GetValue('ParentKeyName')
+                }
+            }
+            catch { }
+        }
+    }
+}
+
 function Get-InfoFabricante {
     # Marca, modelo, serie, página de drivers y herramientas del fabricante instaladas.
     $info = [pscustomobject]@{ Marca = ''; Modelo = ''; Serie = ''; Url = ''; Herramientas = @(); Generico = $false }
@@ -4113,11 +4297,9 @@ function Get-InfoFabricante {
 
     $patron = 'Lenovo Vantage|Lenovo System Update|Lenovo Commercial Vantage|SupportAssist|Dell Command \| Update|Dell Update|HP Support Assistant|HP Image Assistant|MyASUS|ASUS Live Update|Armoury Crate|Acer Care Center|Acer Product Registration|MSI Center|Dragon Center|Intel.*Driver.*Support Assistant|AMD Software|NVIDIA App|GeForce Experience'
     $encontradas = New-Object System.Collections.Generic.List[string]
-    foreach ($ruta in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
-        foreach ($p in @(Get-ItemProperty -Path $ruta -ErrorAction SilentlyContinue)) {
-            $nombre = "$($p.DisplayName)"
-            if ($nombre -match $patron -and -not $encontradas.Contains($nombre)) { $encontradas.Add($nombre) }
-        }
+    foreach ($p in @(Get-EntradasDesinstalar -Rutas @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'))) {
+        $nombre = "$($p.DisplayName)"
+        if ($nombre -match $patron -and -not $encontradas.Contains($nombre)) { $encontradas.Add($nombre) }
     }
     try {
         $apps = @{ 'E046963F.LenovoCompanion' = 'Lenovo Vantage'; 'E046963F.LenovoSettingsforEnterprise' = 'Lenovo Commercial Vantage'; 'B9ECED6F.ASUSPCAssistant' = 'MyASUS'; 'AD2F1837.HPSupportAssistant' = 'HP Support Assistant'; 'DellInc.DellSupportAssistforPCs' = 'Dell SupportAssist' }
@@ -4684,6 +4866,7 @@ $Script:Catalogo = @(
     @{ Cat = 'Sistema'; Titulo = 'Desinstalar una actualización'; Desc = 'Quita una actualización reciente si algo dejó de funcionar después de instalarla.'; Cmd = 'Desinstalar-Actualizacion'; Avanzada = $true }
     @{ Cat = 'Sistema'; Titulo = 'Limpiar archivos temporales'; Desc = 'Temporales, caché de Windows Update y, opcionalmente, la papelera.'; Cmd = 'Limpiar-Temporales' }
     @{ Cat = 'Sistema'; Titulo = 'Revisar disco (CHKDSK)'; Desc = 'Escaneo en línea y CHKDSK al reiniciar si encuentra errores.'; Cmd = 'Revisar-Disco' }
+    @{ Cat = 'Sistema'; Titulo = 'Programas de inicio'; Desc = 'Ver, desactivar y volver a activar lo que arranca con Windows (programas, carpeta Inicio y tareas programadas), con el tiempo de arranque.'; Cmd = 'Mostrar-InicioGui'; Ui = $true }
     @{ Cat = 'Sistema'; Titulo = 'Optimizar rendimiento'; Desc = 'Programas de inicio, plan de energía, efectos visuales e inicio rápido.'; Cmd = 'Optimizar-Rendimiento'; Avanzada = $true }
     @{ Cat = 'Sistema'; Titulo = 'Menú Inicio y búsqueda'; Desc = 'Cuando el menú Inicio o la búsqueda no abren o no encuentran nada.'; Cmd = 'Reparar-MenuInicio'; Avanzada = $true }
     @{ Cat = 'Sistema'; Titulo = 'Iconos y miniaturas'; Desc = 'Reconstruye la caché de iconos cuando se ven en blanco o equivocados.'; Cmd = 'Reparar-CacheIconos'; Avanzada = $true }
@@ -4944,23 +5127,21 @@ function Get-CuentasUsuario {
 function Get-ProgramasInstalados {
     param($Perfil)
     $rutas = @(
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        "$($Perfil.Registro)\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+        "$($Perfil.Registro)\Software\Microsoft\Windows\CurrentVersion\Uninstall"
     )
     $vistos = @{}
     $lista = New-Object System.Collections.Generic.List[object]
-    foreach ($ruta in $rutas) {
-        foreach ($p in @(Get-ItemProperty -Path $ruta -ErrorAction SilentlyContinue)) {
-            $nombre = "$($p.DisplayName)".Trim()
-            if (-not $nombre -or $p.SystemComponent -eq 1 -or $p.ParentKeyName) { continue }
-            $clave = '{0}|{1}' -f $nombre, $p.DisplayVersion
-            if ($vistos.ContainsKey($clave)) { continue }
-            $vistos[$clave] = $true
-            $fecha = ''
-            if ("$($p.InstallDate)" -match '^(\d{4})(\d{2})(\d{2})$') { $fecha = '{0}-{1}-{2}' -f $Matches[1], $Matches[2], $Matches[3] }
-            $lista.Add([pscustomobject]@{ Programa = $nombre; Version = "$($p.DisplayVersion)"; Fabricante = "$($p.Publisher)"; Instalado = $fecha })
-        }
+    foreach ($p in @(Get-EntradasDesinstalar -Rutas $rutas)) {
+        $nombre = "$($p.DisplayName)".Trim()
+        if (-not $nombre -or $p.SystemComponent -eq 1 -or $p.ParentKeyName) { continue }
+        $clave = '{0}|{1}' -f $nombre, $p.DisplayVersion
+        if ($vistos.ContainsKey($clave)) { continue }
+        $vistos[$clave] = $true
+        $fecha = ''
+        if ("$($p.InstallDate)" -match '^(\d{4})(\d{2})(\d{2})$') { $fecha = '{0}-{1}-{2}' -f $Matches[1], $Matches[2], $Matches[3] }
+        $lista.Add([pscustomobject]@{ Programa = $nombre; Version = "$($p.DisplayVersion)"; Fabricante = "$($p.Publisher)"; Instalado = $fecha })
     }
     return @($lista | Sort-Object -Property Programa)
 }
@@ -5657,13 +5838,23 @@ $Script:XamlPrincipal = @'
                     <TextBlock x:Name="TxtResumen" Margin="0,12,0,0" Foreground="#CBD5E1" TextWrapping="Wrap"
                                Text="El diagnóstico revisa hardware, disco, red, sonido, Outlook, seguridad, actualizaciones y más, y sugiere qué reparar."/>
                     <WrapPanel Margin="0,18,0,0">
-                      <Button x:Name="BtnDiagnostico" Content="Diagnóstico completo" Style="{StaticResource Primario}" Margin="0,0,10,8"/>
+                      <Button x:Name="BtnDiagnostico" Content="Analizar el equipo" Style="{StaticResource Primario}" Margin="0,0,10,8" ToolTip="Revisa todo el equipo y calcula un puntaje de salud. No cambia nada."/>
                       <Button x:Name="BtnRepararTodo" Content="Reparar lo encontrado" Style="{StaticResource Exito}" Margin="0,0,10,8" IsEnabled="False"/>
-                      <Button x:Name="BtnReporte" Content="Abrir reporte" Style="{StaticResource Secundario}" Margin="0,0,10,8" IsEnabled="False"/>
-                      <Button x:Name="BtnCompleta" Content="Reparación completa" Style="{StaticResource Secundario}" Margin="0,0,10,8"/>
+                      <Button x:Name="BtnReporte" Content="Ver reporte" Style="{StaticResource Secundario}" Margin="0,0,10,8" IsEnabled="False" ToolTip="Abre el reporte del último análisis en el navegador (se habilita después de analizar)."/>
+                      <Button x:Name="BtnCompleta" Content="Reparación completa" Style="{StaticResource Secundario}" Margin="0,0,10,8" ToolTip="Aplica en bloque las reparaciones generales (archivos de Windows, red, limpieza). Es más lento. Pide confirmación."/>
                     </WrapPanel>
                   </StackPanel>
                 </Grid>
+              </Border>
+
+              <Border x:Name="GuiaInicio" Background="#0F1F3D" CornerRadius="14" Padding="22,18" BorderBrush="#1D4ED8" BorderThickness="1" Margin="0,18,14,0">
+                <StackPanel>
+                  <TextBlock Text="Cómo empezar" FontSize="16" FontWeight="SemiBold" Foreground="#F8FAFC" Margin="0,0,0,10"/>
+                  <TextBlock TextWrapping="Wrap" Foreground="#CBD5E1" Margin="0,0,0,6"><Run FontWeight="Bold" Foreground="#60A5FA">1.  Analizar:</Run><Run Text=" pulse &quot;Analizar el equipo&quot;. Tarda 1 o 2 minutos y no cambia nada."/></TextBlock>
+                  <TextBlock TextWrapping="Wrap" Foreground="#CBD5E1" Margin="0,0,0,6"><Run FontWeight="Bold" Foreground="#60A5FA">2.  Revisar:</Run><Run Text=" verá un puntaje de 0 a 100, los problemas y qué hacer con cada uno."/></TextBlock>
+                  <TextBlock TextWrapping="Wrap" Foreground="#CBD5E1"><Run FontWeight="Bold" Foreground="#60A5FA">3.  Reparar:</Run><Run Text=" pulse &quot;Reparar lo encontrado&quot;. Antes crea un punto de restauración y le pide confirmación."/></TextBlock>
+                  <TextBlock Text="Para algo puntual (red, sonido, Outlook, drivers...) use las categorías del menú de la izquierda." Foreground="#94A3B8" FontSize="12" Margin="0,12,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
               </Border>
 
               <Grid Margin="0,18,14,0">
@@ -5706,7 +5897,7 @@ $Script:XamlPrincipal = @'
           <DockPanel>
             <DockPanel DockPanel.Dock="Top" Margin="16,8,16,4">
               <Button x:Name="BtnLimpiarLog" DockPanel.Dock="Right" Content="Limpiar" Style="{StaticResource Secundario}" Padding="10,3" FontSize="11"/>
-              <TextBlock Text="Registro de actividad" Foreground="#94A3B8" FontSize="12" VerticalAlignment="Center"/>
+              <TextBlock Text="Registro de actividad (aquí se ve qué está haciendo la herramienta)" Foreground="#94A3B8" FontSize="12" VerticalAlignment="Center"/>
             </DockPanel>
             <RichTextBox x:Name="Log" Background="Transparent" BorderThickness="0" IsReadOnly="True" Foreground="#CBD5E1"
                          FontFamily="Consolas" FontSize="12" VerticalScrollBarVisibility="Auto" Margin="10,0,10,8"/>
@@ -5869,6 +6060,7 @@ function Solicitar-Gui {
 function Mostrar-DialogoGui {
     param($Pregunta)
     $tipo = "$($Pregunta.Tipo)"
+    if ($tipo -eq 'Inicio') { Mostrar-InicioGui; return 'OK' }
     [xml]$x = $Script:XamlDialogo
     $dlg = [System.Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
     $titulo = $dlg.FindName('Titulo')
@@ -5884,7 +6076,11 @@ function Mostrar-DialogoGui {
     $mensaje.Text = "$($Pregunta.Texto)"
     if ($Pregunta.Valor) { $entrada.Text = "$($Pregunta.Valor)" }
     switch ($tipo) {
-        'SiNo' { $titulo.Text = 'Confirmar' }
+        'SiNo' {
+            $titulo.Text = 'Confirmar'
+            $btnSi.Content = 'Sí, continuar'
+            $btnNo.Content = 'Cancelar'
+        }
         'Texto' {
             $titulo.Text = 'Ingresar dato'
             $entrada.Visibility = [System.Windows.Visibility]::Visible
@@ -6033,7 +6229,13 @@ function Mostrar-DiagnosticoGui {
     $Script:Gui.TxtPuntaje.Text = "$($p.Puntaje)"
     $Script:Gui.TxtEstadoSalud.Text = $p.Estado
     $Script:Gui.BordeEstado.Background = Get-ColorPincel $p.Color
-    $Script:Gui.TxtResumen.Text = ("{0} problema(s) crítico(s) y {1} alerta(s). Toque una tarjeta para ver el detalle, o use ""Reparar lo encontrado""." -f $p.Criticas, $p.Alertas)
+    $Script:Gui.GuiaInicio.Visibility = [System.Windows.Visibility]::Collapsed
+    if ($p.Criticas -eq 0 -and $p.Alertas -eq 0) {
+        $Script:Gui.TxtResumen.Text = 'No se encontraron problemas. El equipo está en buen estado.'
+    }
+    else {
+        $Script:Gui.TxtResumen.Text = ("Se encontraron {0} problema(s) crítico(s) y {1} alerta(s). Los críticos conviene atenderlos primero. Haga clic en una tarjeta de abajo para ver el detalle, o pulse ""Reparar lo encontrado""." -f $p.Criticas, $p.Alertas)
+    }
     $Script:Gui.TxtSubtitulo.Text = ("Equipo {0} analizado el {1}" -f $env:COMPUTERNAME, $d.Fecha.ToString('dd/MM/yyyy HH:mm'))
 
     $lista = $Script:Gui.ListaAlertas
@@ -6099,7 +6301,7 @@ function Set-OcupadoGui {
     param([bool]$Ocupado, [string]$Titulo = '')
     $Script:Sync.Ocupado = $Ocupado
     $Script:Gui.Progreso.IsIndeterminate = $Ocupado
-    if ($Ocupado) { $Script:Gui.TxtEstado.Text = "Ejecutando: $Titulo..." }
+    if ($Ocupado) { $Script:Gui.TxtEstado.Text = "Trabajando en: $Titulo... (puede tardar unos minutos, no cierre la ventana)" }
     $Script:Gui.BtnDiagnostico.IsEnabled = -not $Ocupado
     $Script:Gui.BtnCompleta.IsEnabled = -not $Ocupado
     $Script:Gui.BtnRepararTodo.IsEnabled = (-not $Ocupado) -and $Script:Gui.HayAcciones
@@ -6135,8 +6337,8 @@ function Finalizar-TareaGui {
         $Script:Sync.PsActual = $null
     }
     Set-OcupadoGui $false
-    if ($Mensaje.Ok) { $Script:Gui.TxtEstado.Text = "Terminado: $($Mensaje.Texto)" }
-    else { $Script:Gui.TxtEstado.Text = "Terminado con advertencias o cancelado: $($Mensaje.Texto)" }
+    if ($Mensaje.Ok) { $Script:Gui.TxtEstado.Text = "✔ Listo: $($Mensaje.Texto)" }
+    else { $Script:Gui.TxtEstado.Text = "⚠ Terminó con avisos o se canceló: $($Mensaje.Texto). Revise el registro de actividad." }
 }
 
 function Procesar-ColaGui {
@@ -6286,7 +6488,7 @@ function Iniciar-InterfazGrafica {
     $nombres = @('Principal', 'PanelLogin', 'TxtClave', 'TxtErrorClave', 'BtnEntrar', 'TxtEquipo', 'TxtVersion', 'PanelNav',
         'PaginaInicio', 'PaginaCategoria', 'TxtSubtitulo', 'ArcoPuntaje', 'TxtPuntaje', 'BordeEstado', 'TxtEstadoSalud', 'TxtResumen',
         'BtnDiagnostico', 'BtnRepararTodo', 'BtnReporte', 'BtnCompleta', 'ListaAlertas', 'ListaSugerencias', 'PanelTarjetas',
-        'TxtCategoria', 'TxtCategoriaDesc', 'PanelAcciones', 'Log', 'BtnLimpiarLog', 'Progreso', 'TxtEstado')
+        'TxtCategoria', 'TxtCategoriaDesc', 'PanelAcciones', 'Log', 'BtnLimpiarLog', 'Progreso', 'TxtEstado', 'GuiaInicio')
     foreach ($n in $nombres) { $Script:Gui[$n] = $ventana.FindName($n) }
 
     $ventana.Title = "Soporte Técnico v$($Script:Version) - $env:COMPUTERNAME"
