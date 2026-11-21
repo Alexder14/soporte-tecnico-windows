@@ -5389,6 +5389,10 @@ $Script:Catalogo = @(
     @{ Cat = 'Herramientas'; Titulo = 'Servicios'; Desc = 'Servicios de Windows.'; Cmd = "Abrir-Herramienta 'services'"; Ui = $true }
     @{ Cat = 'Herramientas'; Titulo = 'Carpeta de reportes'; Desc = 'Diagnósticos, respaldos y reportes.'; Cmd = "Abrir-Herramienta 'reportes'"; Ui = $true }
     @{ Cat = 'Herramientas'; Titulo = 'Abrir el log de esta sesión'; Desc = 'Todo lo que hizo la herramienta.'; Cmd = "Abrir-Herramienta 'log'"; Ui = $true }
+    @{ Cat = 'Formatear equipo'; Titulo = '1. Respaldar datos del cliente'; Desc = 'Escritorio, Documentos, Imágenes, Descargas, correos de Outlook (.pst), favoritos y redes WiFi, a una USB o disco externo.'; Cmd = 'Respaldar-DatosCliente'; Avanzada = $true }
+    @{ Cat = 'Formatear equipo'; Titulo = '2. Respaldar todos los drivers'; Desc = 'Copia los drivers del fabricante para restaurarlos después de formatear.'; Cmd = 'Respaldar-Drivers' }
+    @{ Cat = 'Formatear equipo'; Titulo = '3. Restaurar drivers desde carpeta/USB'; Desc = 'Ya formateado: instala el respaldo de drivers.'; Cmd = 'Instalar-DriversCarpeta' }
+    @{ Cat = 'Formatear equipo'; Titulo = '4. Restaurar datos del cliente'; Desc = 'Copia el respaldo a las carpetas del usuario con sesión. No borra nada ni reemplaza archivos más nuevos.'; Cmd = 'Restaurar-DatosCliente'; Avanzada = $true }
     @{ Cat = 'Reportes'; Titulo = 'Reporte de entrega para el cliente'; Desc = 'Página para el cliente: estado del equipo antes y después, trabajos realizados y pendientes. Se imprime o se guarda como PDF.'; Cmd = 'New-ReporteEntrega'; Avanzada = $true }
     @{ Cat = 'Reportes'; Titulo = 'Reporte de atenciones'; Desc = 'Lo atendido en un período (este mes, el anterior, fechas...): visitas, clientes, equipos y trabajos más frecuentes.'; Cmd = 'New-ReporteAtenciones'; Avanzada = $true }
     @{ Cat = 'Reportes'; Titulo = 'Abrir el historial en Excel'; Desc = 'Todas las visitas (Historial.csv). Ciérrelo antes de terminar la visita.'; Cmd = 'Abrir-HistorialExcel'; Ui = $true; Avanzada = $true }
@@ -6617,6 +6621,485 @@ function Abrir-HistorialExcel {
 
 #endregion
 
+#region ==================== FORMATEO: RESPALDAR Y RESTAURAR DATOS DEL CLIENTE ====================
+
+function Test-CodigoRobocopy {
+    # robocopy: 0 a 7 = correcto (copió, no había nada que copiar o hubo diferencias); 8 o más = errores.
+    param([int]$Codigo)
+    return ($Codigo -ge 0 -and $Codigo -lt 8)
+}
+
+function Get-CarpetasDatosUsuario {
+    # Carpetas personales del usuario con sesión, con su ruta real (aunque estén redirigidas).
+    param($Perfil)
+    $lista = @(
+        @{ Clave = 'Desktop'; Nombre = 'Escritorio' },
+        @{ Clave = 'Personal'; Nombre = 'Documentos' },
+        @{ Clave = 'My Pictures'; Nombre = 'Imágenes' },
+        @{ Clave = '{374DE290-123F-4565-9164-39C4925E467B}'; Nombre = 'Descargas' },
+        @{ Clave = 'My Music'; Nombre = 'Música' },
+        @{ Clave = 'My Video'; Nombre = 'Videos' }
+    )
+    $resultado = New-Object System.Collections.Generic.List[object]
+    foreach ($c in $lista) {
+        $ruta = Get-CarpetaUsuario $Perfil $c.Clave
+        if (-not $ruta -or -not (Test-Path -LiteralPath $ruta -PathType Container)) { continue }
+        $resultado.Add([pscustomobject]@{
+                Clave      = $c.Clave
+                Nombre     = $c.Nombre
+                Ruta       = $ruta
+                EnOneDrive = ($ruta -match '\\OneDrive( - [^\\]+)?(\\|$)')
+            })
+    }
+    return $resultado.ToArray()
+}
+
+function Get-ResumenCarpeta {
+    # Tamaño total y archivos de más de 4 GB (no caben en una USB con FAT32).
+    param([string]$Ruta)
+    $total = [long]0
+    $grandes = New-Object System.Collections.Generic.List[string]
+    foreach ($f in @(Get-ChildItem -LiteralPath $Ruta -Recurse -Force -File -ErrorAction SilentlyContinue)) {
+        # Los archivos "solo en la nube" de OneDrive no ocupan espacio local: no se cuentan
+        if ($f.Attributes -band [System.IO.FileAttributes]::Offline) { continue }
+        $total += $f.Length
+        if ($f.Length -ge 4GB) { $grandes.Add($f.FullName) }
+    }
+    return [pscustomobject]@{ Bytes = $total; Grandes = $grandes.ToArray() }
+}
+
+function Format-Tamano {
+    param([long]$Bytes)
+    if ($Bytes -ge 1GB) { return ('{0:N1} GB' -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ('{0:N0} MB' -f ($Bytes / 1MB)) }
+    return ('{0:N0} KB' -f ($Bytes / 1KB))
+}
+
+function Get-ArchivosPst {
+    # Archivos de datos de Outlook (.pst) del usuario: en sus lugares habituales.
+    param($Perfil, [string]$Documentos)
+    $encontrados = New-Object System.Collections.Generic.List[string]
+    $lugares = @((Join-Path $Perfil.LocalAppData 'Microsoft\Outlook'))
+    if ($Documentos) { $lugares += $Documentos; $lugares += (Join-Path $Documentos 'Archivos de Outlook'); $lugares += (Join-Path $Documentos 'Outlook Files') }
+    foreach ($l in $lugares) {
+        if (Test-Path -LiteralPath $l) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $l -Filter '*.pst' -File -ErrorAction SilentlyContinue)) {
+                if (-not $encontrados.Contains($f.FullName)) { $encontrados.Add($f.FullName) }
+            }
+        }
+    }
+    return $encontrados.ToArray()
+}
+
+function Get-PerfilesNavegador {
+    # Perfiles de Chrome, Edge y Brave con favoritos (archivo Bookmarks) y de Firefox (places.sqlite).
+    param($Perfil)
+    $r = New-Object System.Collections.Generic.List[object]
+    $roaming = Join-Path $Perfil.Ruta 'AppData\Roaming'
+    foreach ($n in @(@{ Nombre = 'Chrome'; Ruta = 'Google\Chrome\User Data'; Proceso = 'chrome' }, @{ Nombre = 'Edge'; Ruta = 'Microsoft\Edge\User Data'; Proceso = 'msedge' }, @{ Nombre = 'Brave'; Ruta = 'BraveSoftware\Brave-Browser\User Data'; Proceso = 'brave' })) {
+        $datos = Join-Path $Perfil.LocalAppData $n.Ruta
+        if (-not (Test-Path -LiteralPath $datos)) { continue }
+        foreach ($d in @(Get-ChildItem -LiteralPath $datos -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' })) {
+            $archivo = Join-Path $d.FullName 'Bookmarks'
+            if (Test-Path -LiteralPath $archivo) { $r.Add([pscustomobject]@{ Navegador = $n.Nombre; Perfil = $d.Name; Carpeta = $d.FullName; Archivos = @('Bookmarks'); Proceso = $n.Proceso }) }
+        }
+    }
+    $ff = Join-Path $roaming 'Mozilla\Firefox\Profiles'
+    if (Test-Path -LiteralPath $ff) {
+        foreach ($d in @(Get-ChildItem -LiteralPath $ff -Directory -ErrorAction SilentlyContinue)) {
+            if (Test-Path -LiteralPath (Join-Path $d.FullName 'places.sqlite')) {
+                $r.Add([pscustomobject]@{ Navegador = 'Firefox'; Perfil = $d.Name; Carpeta = $d.FullName; Archivos = @('places.sqlite', 'favicons.sqlite'); Proceso = 'firefox' })
+            }
+        }
+    }
+    return $r.ToArray()
+}
+
+function Copiar-ConRobocopy {
+    # Copia una carpeta con robocopy, sin listar cada archivo (miles de líneas saturarían el registro)
+    # y con el detalle en un log. /XJ evita los bucles de las uniones del perfil; nunca /MIR ni /PURGE.
+    param([string]$Origen, [string]$Destino, [string]$Log, [string]$Descripcion, [switch]$NoSobrescribirNuevos, [string[]]$Archivos = @())
+    $o = $Origen.TrimEnd('\'); if ($o -match '^[A-Za-z]:$') { $o += '\.' }
+    $d = $Destino.TrimEnd('\'); if ($d -match '^[A-Za-z]:$') { $d += '\.' }
+    $argumentos = '"{0}" "{1}"' -f $o, $d
+    foreach ($a in $Archivos) { $argumentos += (' "{0}"' -f $a) }
+    if ($Archivos.Count -eq 0) { $argumentos += ' /E' }
+    $argumentos += ' /XJ /R:1 /W:1 /COPY:DAT /DCOPY:T /XF desktop.ini /A-:SH /MT:8 /NFL /NDL /NP'
+    if ($NoSobrescribirNuevos) { $argumentos += ' /XO' }
+    $argumentos += (' /LOG+:"{0}"' -f $Log)
+    $codigo = Invoke-Nativo -Archivo (Get-RutaSistema 'robocopy.exe') -Argumentos $argumentos -Descripcion $Descripcion
+    if (Test-CodigoRobocopy $codigo) {
+        Write-Log ("{0}: listo." -f $Descripcion) 'OK'
+        return $true
+    }
+    Write-Log ("{0}: hubo errores (código {1}). Detalle en {2}" -f $Descripcion, $codigo, $Log) 'ERROR'
+    return $false
+}
+
+function Respaldar-DatosCliente {
+    Mostrar-Titulo 'RESPALDAR DATOS DEL CLIENTE'
+    Write-Host '    Copia los archivos personales del usuario con sesión antes de formatear: sus carpetas,' -ForegroundColor DarkGray
+    Write-Host '    los correos de Outlook (.pst), los favoritos de los navegadores y las redes WiFi.' -ForegroundColor DarkGray
+    $perfil = Get-PerfilUsuarioActivo
+    Write-Log ("Usuario: {0} ({1})" -f $perfil.Usuario, $perfil.Ruta) 'INFO'
+    Write-Host '    Calculando el tamaño de cada carpeta...' -ForegroundColor DarkGray
+    $carpetas = @(Get-CarpetasDatosUsuario $perfil)
+    $documentos = ($carpetas | Where-Object { $_.Clave -eq 'Personal' } | Select-Object -First 1).Ruta
+
+    # Opciones: carpetas + Outlook + favoritos + WiFi
+    $opciones = New-Object System.Collections.Generic.List[object]
+    foreach ($c in $carpetas) {
+        $res = Get-ResumenCarpeta $c.Ruta
+        $texto = '{0} - {1}' -f $c.Nombre, (Format-Tamano $res.Bytes)
+        if ($c.EnOneDrive) { $texto += ' (está en OneDrive: ya está en la nube)' }
+        $opciones.Add([pscustomobject]@{ Tipo = 'Carpeta'; Texto = $texto; Dato = $c; Bytes = $res.Bytes; Grandes = $res.Grandes; Predeterminada = (-not $c.EnOneDrive) })
+    }
+    $psts = @(Get-ArchivosPst $perfil $documentos | Where-Object { -not $documentos -or -not $_.StartsWith($documentos + '\', [System.StringComparison]::OrdinalIgnoreCase) })
+    $pstsDentro = @(Get-ArchivosPst $perfil $documentos | Where-Object { $documentos -and $_.StartsWith($documentos + '\', [System.StringComparison]::OrdinalIgnoreCase) })
+    if ($psts.Count -gt 0) {
+        $bytes = [long]0; $grandes = @()
+        foreach ($p in $psts) { $len = (Get-Item -LiteralPath $p).Length; $bytes += $len; if ($len -ge 4GB) { $grandes += $p } }
+        $opciones.Add([pscustomobject]@{ Tipo = 'Pst'; Texto = ('Correos de Outlook guardados fuera de Documentos ({0} archivo(s) .pst, {1})' -f $psts.Count, (Format-Tamano $bytes)); Dato = $psts; Bytes = $bytes; Grandes = $grandes; Predeterminada = $true })
+    }
+    $navegadores = @(Get-PerfilesNavegador $perfil)
+    if ($navegadores.Count -gt 0) {
+        $opciones.Add([pscustomobject]@{ Tipo = 'Favoritos'; Texto = ('Favoritos de los navegadores ({0})' -f ((@($navegadores | ForEach-Object { $_.Navegador }) | Select-Object -Unique) -join ', ')); Dato = $navegadores; Bytes = [long]0; Grandes = @(); Predeterminada = $true })
+    }
+    $hayWifi = $false
+    try { $hayWifi = [bool](Get-Service -Name 'WlanSvc' -ErrorAction Stop) } catch { }
+    if ($hayWifi) {
+        $opciones.Add([pscustomobject]@{ Tipo = 'Wifi'; Texto = 'Redes WiFi guardadas (con sus claves, en un archivo cifrado que solo abre esta herramienta)'; Dato = $null; Bytes = [long]0; Grandes = @(); Predeterminada = $true })
+    }
+    if ($opciones.Count -eq 0) { Write-Log 'No se encontraron datos que respaldar.' 'ADVERTENCIA'; return $false }
+    $predet = @(for ($i = 0; $i -lt $opciones.Count; $i++) { if ($opciones[$i].Predeterminada) { $i } })
+    $indices = Elegir-Varias -Pregunta '¿Qué respaldar?' -Opciones @($opciones | ForEach-Object { $_.Texto }) -Predeterminadas $predet
+    if ($null -eq $indices -or @($indices).Count -eq 0) { Write-Log 'Operación cancelada.' 'INFO'; return $false }
+    $elegidas = @($indices | ForEach-Object { $opciones[$_] })
+    if ($pstsDentro.Count -gt 0 -and @($elegidas | Where-Object { $_.Tipo -eq 'Carpeta' -and $_.Dato.Clave -eq 'Personal' }).Count -gt 0) {
+        Write-Host ("    Hay {0} archivo(s) .pst dentro de Documentos: se copian con esa carpeta." -f $pstsDentro.Count) -ForegroundColor DarkGray
+    }
+
+    # Destino
+    $nombre = 'Datos_{0}_{1}' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmm')
+    $sugerido = ''
+    if ($Script:EnUsb) { $sugerido = Join-Path $Script:Base $nombre }
+    if ($Script:ModoInterfaz -eq 'Grafica') {
+        $resp = Solicitar-Gui -Tipo 'Texto' -Texto 'Carpeta de destino (una USB o un disco externo; NO el disco del equipo que va a formatear).' -Valor $sugerido
+        if ($Sync.Cancelado) { Write-Log 'Operación cancelada.' 'INFO'; return $false }
+    }
+    else {
+        $textoEnter = ''
+        if ($sugerido) { $textoEnter = " (Enter = $sugerido)" }
+        $resp = Read-Host ("  Carpeta de destino: USB o disco externo, no el disco que va a formatear{0}" -f $textoEnter)
+        if (-not "$resp".Trim()) { $resp = $sugerido }
+    }
+    $destino = "$resp".Trim().Trim('"').TrimEnd('\')
+    if (-not $destino) { Write-Log 'No se indicó la carpeta de destino.' 'INFO'; return $false }
+    if ($destino -match '^[A-Za-z]:$') { $destino = Join-Path ($destino + '\') $nombre }
+    $raizDestino = [System.IO.Path]::GetPathRoot($destino)
+    if ($raizDestino.TrimEnd('\') -ieq $env:SystemDrive) {
+        Write-Log ("El destino está en el disco del sistema ({0}): se perdería al formatear. Use una USB o un disco externo." -f $env:SystemDrive) 'ERROR'
+        return $false
+    }
+    foreach ($o in @($elegidas | Where-Object { $_.Tipo -eq 'Carpeta' })) {
+        if (($destino + '\').StartsWith($o.Dato.Ruta + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-Log ("El destino está dentro de {0}, que también se va a copiar." -f $o.Dato.Nombre) 'ERROR'
+            return $false
+        }
+    }
+
+    # Espacio y sistema de archivos
+    $total = [long]0; foreach ($o in $elegidas) { $total += [long]$o.Bytes }
+    try {
+        $disco = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $raizDestino.TrimEnd('\')) -ErrorAction Stop
+        if ($disco.FreeSpace -lt ($total + 200MB)) {
+            Write-Log ("No hay espacio suficiente: se necesitan {0} y hay {1} libres en {2}." -f (Format-Tamano $total), (Format-Tamano $disco.FreeSpace), $raizDestino) 'ERROR'
+            return $false
+        }
+        if ("$($disco.FileSystem)" -eq 'FAT32') {
+            $grandes = @($elegidas | ForEach-Object { $_.Grandes } | Where-Object { $_ })
+            if ($grandes.Count -gt 0) {
+                Write-Log ("El destino es FAT32 y no admite archivos de más de 4 GB. No se podrán copiar: {0}" -f ($grandes -join '; ')) 'ADVERTENCIA'
+                if (-not (Confirmar '¿Continuar sin esos archivos? (o cancele y use un disco en NTFS o exFAT)')) { return $false }
+            }
+        }
+    }
+    catch { Write-Log "No se pudo revisar el espacio del destino: $($_.Exception.Message)" 'ADVERTENCIA' }
+
+    Write-Host ("    Se van a copiar {0} a {1}" -f (Format-Tamano $total), $destino) -ForegroundColor Cyan
+    if (-not (Confirmar '¿Empezar el respaldo?')) { return $false }
+    if ((@($elegidas | Where-Object { $_.Tipo -eq 'Pst' }).Count -gt 0) -or ($pstsDentro.Count -gt 0)) {
+        if (-not (Cerrar-Outlook)) { Write-Log 'Outlook sigue abierto: los .pst pueden no copiarse.' 'ADVERTENCIA' }
+    }
+    try { New-Item -ItemType Directory -Path $destino -Force -ErrorAction Stop | Out-Null }
+    catch { Write-Log "No se pudo crear ${destino}: $($_.Exception.Message)" 'ERROR'; return $false }
+    $log = Join-Path $destino 'robocopy.log'
+
+    $manifiesto = New-Object System.Collections.Generic.List[string]
+    $manifiesto.Add('# Respaldo de datos de Soporte Técnico. No modifique este archivo: lo usa "Restaurar datos del cliente".')
+    $manifiesto.Add("Equipo=$env:COMPUTERNAME")
+    $manifiesto.Add("Serie=$($Sync.Visita.Serie)")
+    $manifiesto.Add("Usuario=$($perfil.Usuario)")
+    $manifiesto.Add("Fecha=$(Get-Date -Format 'dd/MM/yyyy HH:mm')")
+    $fallos = 0
+    foreach ($o in $elegidas) {
+        switch ($o.Tipo) {
+            'Carpeta' {
+                $sub = Join-Path $destino $o.Dato.Nombre
+                if (Copiar-ConRobocopy -Origen $o.Dato.Ruta -Destino $sub -Log $log -Descripcion ("Copiar {0}" -f $o.Dato.Nombre)) {
+                    $manifiesto.Add(('Carpeta={0}|{1}|{2}' -f $o.Dato.Clave, $o.Dato.Nombre, $o.Dato.Ruta))
+                }
+                else { $fallos++ }
+            }
+            'Pst' {
+                $sub = Join-Path $destino 'Correos_Outlook'
+                foreach ($p in $o.Dato) {
+                    if (Copiar-ConRobocopy -Origen (Split-Path -Parent $p) -Destino $sub -Archivos @((Split-Path -Leaf $p)) -Log $log -Descripcion ("Copiar {0}" -f (Split-Path -Leaf $p))) {
+                        $manifiesto.Add(('Pst={0}' -f $p))
+                    }
+                    else { $fallos++ }
+                }
+            }
+            'Favoritos' {
+                foreach ($n in $o.Dato) {
+                    $sub = Join-Path $destino ('Favoritos\{0}\{1}' -f $n.Navegador, $n.Perfil)
+                    try {
+                        New-Item -ItemType Directory -Path $sub -Force | Out-Null
+                        foreach ($a in $n.Archivos) {
+                            $origen = Join-Path $n.Carpeta $a
+                            if (Test-Path -LiteralPath $origen) { Copy-Item -LiteralPath $origen -Destination $sub -Force -ErrorAction Stop }
+                        }
+                        $manifiesto.Add(('Favoritos={0}|{1}' -f $n.Navegador, $n.Perfil))
+                        Write-Log ("Favoritos de {0} ({1}) copiados." -f $n.Navegador, $n.Perfil) 'OK'
+                    }
+                    catch {
+                        $fallos++
+                        Write-Log ("No se pudieron copiar los favoritos de {0} ({1}): {2}. Si el navegador está abierto, ciérrelo y repita." -f $n.Navegador, $n.Perfil, $_.Exception.Message) 'ERROR'
+                    }
+                }
+            }
+            'Wifi' {
+                if (Respaldar-RedesWifi -Archivo (Join-Path $destino 'Redes_WiFi.stv')) { $manifiesto.Add('Wifi=Redes_WiFi.stv') } else { $fallos++ }
+            }
+        }
+    }
+    try {
+        [System.IO.File]::WriteAllLines((Join-Path $destino 'manifiesto.txt'), $manifiesto, (New-Object System.Text.UTF8Encoding($true)))
+        $leeme = @(
+            "Respaldo de datos de $env:COMPUTERNAME ($($perfil.Usuario)) - $(Get-Date -Format 'dd/MM/yyyy HH:mm')",
+            '',
+            'Para restaurar: Soporte Técnico > Formatear equipo > "Restaurar datos del cliente".',
+            'Las carpetas también se pueden copiar a mano. Las redes WiFi (Redes_WiFi.stv) solo las restaura la herramienta.'
+        )
+        [System.IO.File]::WriteAllLines((Join-Path $destino 'LEEME.txt'), $leeme, (New-Object System.Text.UTF8Encoding($true)))
+    }
+    catch { Write-Log "No se pudo escribir el manifiesto: $($_.Exception.Message)" 'ERROR'; $fallos++ }
+    $tamano = Format-Tamano (Get-TamanoCarpeta $destino)
+    if ($fallos -gt 0) {
+        Write-Log ("Respaldo INCOMPLETO: {0} parte(s) con errores ({1} copiados en {2}). Revise robocopy.log antes de formatear." -f $fallos, $tamano, $destino) 'ERROR'
+        return $false
+    }
+    Write-Log ("Respaldo de datos listo: {0} en {1}" -f $tamano, $destino) 'OK'
+    return $true
+}
+
+function Respaldar-RedesWifi {
+    # Exporta las redes WiFi con sus claves y las guarda SOLO cifradas (.stv). Los XML con las claves
+    # en texto existen únicamente en una carpeta temporal que se borra siempre.
+    param([string]$Archivo)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $temp = Join-Path $env:TEMP ('soporte_wifi_{0}' -f [guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $temp -Force | Out-Null
+        $netsh = Get-RutaSistema 'netsh.exe'
+        $p = Start-Process -FilePath $netsh -ArgumentList ('wlan export profile folder="{0}" key=clear' -f $temp) -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
+        $xmls = @(Get-ChildItem -LiteralPath $temp -Filter '*.xml' -File -ErrorAction SilentlyContinue)
+        if ($xmls.Count -eq 0) { Write-Log ("No hay redes WiFi guardadas (netsh terminó con código {0})." -f $p.ExitCode) 'INFO'; return $true }
+        $zip = "$temp.zip"
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($temp, $zip)
+        $original = [System.IO.File]::ReadAllBytes($zip)
+        $cifrado = Protect-ArchivoVisita $original
+        $prueba = Unprotect-ArchivoVisita $cifrado
+        if ([Convert]::ToBase64String($prueba) -ne [Convert]::ToBase64String($original)) { throw 'la comprobación del archivo cifrado falló' }
+        [System.IO.File]::WriteAllBytes($Archivo, $cifrado)
+        Write-Log ("{0} red(es) WiFi guardadas cifradas en {1}" -f $xmls.Count, (Split-Path -Leaf $Archivo)) 'OK'
+        return $true
+    }
+    catch {
+        Write-Log "No se pudieron respaldar las redes WiFi: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+    finally {
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath "$temp.zip" -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Restaurar-RedesWifi {
+    param([string]$Archivo)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $temp = Join-Path $env:TEMP ('soporte_wifi_{0}' -f [guid]::NewGuid().ToString('N'))
+    try {
+        [System.IO.File]::WriteAllBytes("$temp.zip", (Unprotect-ArchivoVisita ([System.IO.File]::ReadAllBytes($Archivo))))
+        [System.IO.Compression.ZipFile]::ExtractToDirectory("$temp.zip", $temp)
+        $ok = 0; $mal = 0
+        foreach ($x in @(Get-ChildItem -LiteralPath $temp -Filter '*.xml' -File)) {
+            $p = Start-Process -FilePath (Get-RutaSistema 'netsh.exe') -ArgumentList ('wlan add profile filename="{0}" user=all' -f $x.FullName) -WindowStyle Hidden -Wait -PassThru
+            if ($p.ExitCode -eq 0) { $ok++ } else { $mal++ }
+        }
+        Write-Log ("Redes WiFi restauradas: {0} (con error: {1})." -f $ok, $mal) $(if ($mal -eq 0) { 'OK' } else { 'ADVERTENCIA' })
+        return ($mal -eq 0)
+    }
+    catch {
+        Write-Log "No se pudieron restaurar las redes WiFi: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+    finally {
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath "$temp.zip" -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Leer-Manifiesto {
+    param([string]$Carpeta)
+    $archivo = Join-Path $Carpeta 'manifiesto.txt'
+    if (-not (Test-Path -LiteralPath $archivo)) { return $null }
+    $m = [pscustomobject]@{ Carpeta = $Carpeta; Equipo = ''; Serie = ''; Usuario = ''; Fecha = ''; Carpetas = @(); Pst = @(); Favoritos = @(); Wifi = '' }
+    $carpetas = New-Object System.Collections.Generic.List[object]
+    $psts = New-Object System.Collections.Generic.List[string]
+    $favoritos = New-Object System.Collections.Generic.List[object]
+    foreach ($l in @(Get-Content -LiteralPath $archivo -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+        if ($l -match '^(Equipo|Serie|Usuario|Fecha|Wifi)=(.*)$') { $m.($Matches[1]) = $Matches[2].Trim() }
+        elseif ($l -match '^Carpeta=([^|]*)\|([^|]*)\|(.*)$') { $carpetas.Add([pscustomobject]@{ Clave = $Matches[1]; Nombre = $Matches[2]; RutaOriginal = $Matches[3] }) }
+        elseif ($l -match '^Pst=(.*)$') { $psts.Add($Matches[1]) }
+        elseif ($l -match '^Favoritos=([^|]*)\|(.*)$') { $favoritos.Add([pscustomobject]@{ Navegador = $Matches[1]; Perfil = $Matches[2] }) }
+    }
+    $m.Carpetas = $carpetas.ToArray(); $m.Pst = $psts.ToArray(); $m.Favoritos = $favoritos.ToArray()
+    return $m
+}
+
+function Restaurar-DatosCliente {
+    Mostrar-Titulo 'RESTAURAR DATOS DEL CLIENTE'
+    Write-Host '    Copia un respaldo hecho con "Respaldar datos del cliente" a las carpetas del usuario con sesión.' -ForegroundColor DarkGray
+    Write-Host '    No borra nada y no reemplaza archivos más nuevos que ya estén en el equipo.' -ForegroundColor DarkGray
+
+    # Respaldos disponibles en la USB (todas las carpetas de clientes, porque al formatear cambia el nombre del equipo)
+    $respaldos = New-Object System.Collections.Generic.List[object]
+    if ($Script:EnUsb) {
+        $clientes = Split-Path -Parent $Script:Base
+        foreach ($d in @(Get-ChildItem -LiteralPath $clientes -Directory -ErrorAction SilentlyContinue)) {
+            foreach ($r in @(Get-ChildItem -LiteralPath $d.FullName -Directory -Filter 'Datos_*' -ErrorAction SilentlyContinue)) {
+                $m = Leer-Manifiesto $r.FullName
+                if ($m) { $respaldos.Add($m) }
+            }
+        }
+    }
+    $serie = "$($Sync.Visita.Serie)"
+    $ordenados = @($respaldos | Sort-Object -Property @{ e = { if ((Test-SerieValida $serie) -and $_.Serie -eq $serie) { 0 } else { 1 } } }, @{ e = { $_.Carpeta }; Descending = $true })
+    $opciones = @($ordenados | ForEach-Object {
+            $marca = ''
+            if ((Test-SerieValida $serie) -and $_.Serie -eq $serie) { $marca = '  <- ESTE EQUIPO' }
+            '{0} | {1} | {2}{3}' -f $_.Equipo, $_.Fecha, $_.Usuario, $marca
+        })
+    $opciones += 'Otra carpeta...'
+    $i = Elegir-Opcion -Pregunta '  Respaldo a restaurar' -Opciones $opciones
+    if ($i -lt 0) { Write-Log 'Operación cancelada.' 'INFO'; return $false }
+    if ($i -lt $ordenados.Count) { $m = $ordenados[$i] }
+    else {
+        $ruta = "$(Read-Host '  Carpeta del respaldo (la que contiene manifiesto.txt)')".Trim().Trim('"').TrimEnd('\')
+        $m = $null
+        if ($ruta) { $m = Leer-Manifiesto $ruta }
+        if (-not $m) { Write-Log "No es una carpeta de respaldo de esta herramienta (falta manifiesto.txt): $ruta" 'ERROR'; return $false }
+    }
+
+    $perfil = Get-PerfilUsuarioActivo
+    $actuales = @(Get-CarpetasDatosUsuario $perfil)
+    Write-Log ("Restaurar el respaldo de {0} ({1}) en el usuario {2}" -f $m.Equipo, $m.Fecha, $perfil.Usuario) 'INFO'
+    $plan = New-Object System.Collections.Generic.List[object]
+    foreach ($c in $m.Carpetas) {
+        $origen = Join-Path $m.Carpeta $c.Nombre
+        $destino = ($actuales | Where-Object { $_.Clave -eq $c.Clave } | Select-Object -First 1).Ruta
+        if (-not $destino) { $destino = Get-CarpetaUsuario $perfil $c.Clave }
+        if ((Test-Path -LiteralPath $origen) -and $destino) {
+            $plan.Add([pscustomobject]@{ Nombre = $c.Nombre; Origen = $origen; Destino = $destino })
+            Write-Host ("    {0} -> {1}" -f $c.Nombre, $destino) -ForegroundColor Cyan
+        }
+    }
+    $hayPst = Test-Path -LiteralPath (Join-Path $m.Carpeta 'Correos_Outlook')
+    $hayFav = Test-Path -LiteralPath (Join-Path $m.Carpeta 'Favoritos')
+    $hayWifi = $m.Wifi -and (Test-Path -LiteralPath (Join-Path $m.Carpeta $m.Wifi))
+    if ($hayPst) { Write-Host '    Correos de Outlook (.pst) -> Documentos\Archivos de Outlook' -ForegroundColor Cyan }
+    if ($hayFav) { Write-Host '    Favoritos de los navegadores' -ForegroundColor Cyan }
+    if ($hayWifi) { Write-Host '    Redes WiFi' -ForegroundColor Cyan }
+    if ($plan.Count -eq 0 -and -not $hayPst -and -not $hayFav -and -not $hayWifi) { Write-Log 'El respaldo está vacío.' 'ADVERTENCIA'; return $false }
+    if (-not (Confirmar '¿Restaurar estos datos?')) { return $false }
+
+    $log = Join-Path $env:TEMP ('soporte_restaurar_{0}.log' -f (Get-Date -Format 'yyyyMMddHHmmss'))
+    $fallos = 0
+    foreach ($p in $plan) {
+        if (-not (Copiar-ConRobocopy -Origen $p.Origen -Destino $p.Destino -Log $log -NoSobrescribirNuevos -Descripcion ("Restaurar {0}" -f $p.Nombre))) { $fallos++ }
+    }
+    $documentos = ($actuales | Where-Object { $_.Clave -eq 'Personal' } | Select-Object -First 1).Ruta
+    if ($hayPst -and $documentos) {
+        $destinoPst = Join-Path $documentos 'Archivos de Outlook'
+        if (Copiar-ConRobocopy -Origen (Join-Path $m.Carpeta 'Correos_Outlook') -Destino $destinoPst -Log $log -NoSobrescribirNuevos -Descripcion 'Restaurar correos de Outlook (.pst)') {
+            Write-Log ("Para ver los correos: en Outlook, Archivo > Abrir y exportar > Abrir archivo de datos de Outlook, y elija los .pst de {0}" -f $destinoPst) 'INFO'
+        }
+        else { $fallos++ }
+    }
+    if ($hayFav) { if (-not (Restaurar-Favoritos -Respaldo (Join-Path $m.Carpeta 'Favoritos') -Perfil $perfil)) { $fallos++ } }
+    if ($hayWifi) { if (-not (Restaurar-RedesWifi -Archivo (Join-Path $m.Carpeta $m.Wifi))) { $fallos++ } }
+    Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
+    if ($fallos -gt 0) { Write-Log ("Restauración terminada con {0} parte(s) con errores." -f $fallos) 'ADVERTENCIA'; return $false }
+    Write-Log 'Datos del cliente restaurados.' 'OK'
+    return $true
+}
+
+function Restaurar-Favoritos {
+    # Chrome, Edge y Brave: se reemplaza el archivo Bookmarks del perfil (el anterior queda como copia).
+    # Firefox, o si el navegador nunca se abrió: los archivos quedan en el escritorio con instrucciones.
+    param([string]$Respaldo, $Perfil)
+    $ok = $true
+    $rutas = @{ 'Chrome' = 'Google\Chrome\User Data'; 'Edge' = 'Microsoft\Edge\User Data'; 'Brave' = 'BraveSoftware\Brave-Browser\User Data' }
+    $procesos = @{ 'Chrome' = 'chrome'; 'Edge' = 'msedge'; 'Brave' = 'brave'; 'Firefox' = 'firefox' }
+    $escritorio = Get-CarpetaUsuario $Perfil 'Desktop'
+    $paraMano = Join-Path $escritorio 'Favoritos respaldados'
+    foreach ($nav in @(Get-ChildItem -LiteralPath $Respaldo -Directory -ErrorAction SilentlyContinue)) {
+        foreach ($perfilNav in @(Get-ChildItem -LiteralPath $nav.FullName -Directory -ErrorAction SilentlyContinue)) {
+            $hecho = $false
+            if ($rutas.ContainsKey($nav.Name)) {
+                $destino = Join-Path (Join-Path $Perfil.LocalAppData $rutas[$nav.Name]) $perfilNav.Name
+                $abierto = @(Get-Process -Name $procesos[$nav.Name] -ErrorAction SilentlyContinue).Count -gt 0
+                if ($abierto) { Write-Log ("{0} está abierto: ciérrelo y repita para restaurar sus favoritos automáticamente." -f $nav.Name) 'ADVERTENCIA' }
+                elseif (Test-Path -LiteralPath $destino) {
+                    try {
+                        $actual = Join-Path $destino 'Bookmarks'
+                        if (Test-Path -LiteralPath $actual) { Copy-Item -LiteralPath $actual -Destination ('{0}.antes_{1}' -f $actual, (Get-Date -Format 'yyyyMMddHHmmss')) -Force }
+                        Copy-Item -LiteralPath (Join-Path $perfilNav.FullName 'Bookmarks') -Destination $actual -Force -ErrorAction Stop
+                        Write-Log ("Favoritos de {0} ({1}) restaurados." -f $nav.Name, $perfilNav.Name) 'OK'
+                        $hecho = $true
+                    }
+                    catch { Write-Log ("No se pudieron restaurar los favoritos de {0}: {1}" -f $nav.Name, $_.Exception.Message) 'ERROR'; $ok = $false }
+                }
+                else { Write-Log ("{0} todavía no se ha abierto en este usuario: ábralo una vez y repita, o importe los favoritos a mano." -f $nav.Name) 'INFO' }
+            }
+            if (-not $hecho) {
+                $sub = Join-Path $paraMano ('{0}\{1}' -f $nav.Name, $perfilNav.Name)
+                try {
+                    New-Item -ItemType Directory -Path $sub -Force | Out-Null
+                    Copy-Item -Path (Join-Path $perfilNav.FullName '*') -Destination $sub -Force -ErrorAction Stop
+                    Write-Log ("Favoritos de {0} copiados a {1} para importarlos a mano." -f $nav.Name, $sub) 'INFO'
+                    if ($nav.Name -eq 'Firefox') { Write-Log 'Firefox: cierre Firefox y copie places.sqlite y favicons.sqlite a la carpeta de su perfil (about:profiles > Abrir carpeta).' 'INFO' }
+                }
+                catch { $ok = $false }
+            }
+        }
+    }
+    return $ok
+}
+
+#endregion
+
 #region ==================== INTERFAZ GRÁFICA: DISEÑO (XAML) ====================
 
 $Script:XamlPrincipal = @'
@@ -6873,6 +7356,7 @@ $Script:CategoriasGui = [ordered]@{
     'Sonido y dispositivos' = @{ Icono = 0xE767; Desc = 'Audio, micrófono, cámara, Bluetooth, USB, impresoras y batería.' }
     'Outlook y Office'      = @{ Icono = 0xE715; Desc = 'Outlook, Office, OneDrive y Teams.' }
     'Seguridad'             = @{ Icono = 0xEA18; Desc = 'Antivirus, firewall y BitLocker.' }
+    'Formatear equipo'      = @{ Icono = 0xE777; Desc = 'Paso a paso: respaldar datos y drivers, formatear, restaurar drivers y datos, e instalar los programas.' }
     'Reportes'              = @{ Icono = 0xE9F9; Desc = 'Reporte de entrega para el cliente, reporte de lo atendido por período e historial de visitas.' }
     'Herramientas'          = @{ Icono = 0xE90F; Desc = 'Accesos directos a las herramientas de Windows (se abren al instante, aunque haya una tarea en curso).' }
 }
