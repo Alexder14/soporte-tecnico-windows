@@ -1,6 +1,6 @@
-# Soporte Técnico para Windows 10/11 (v2.7)
+# Soporte Técnico para Windows 10/11 (v2.8)
 
-> **Estado: en desarrollo.** La versión 2.7 todavía no se ha probado en un equipo Windows real. Úsela primero en un equipo de prueba.
+> **Estado: en desarrollo.** Hasta la versión 2.7 se probó en Windows. Las funciones nuevas de la 2.8 (Formatear equipo y Reportes) todavía no. Úselas primero en un equipo de prueba.
 
 Herramienta portable para técnicos de soporte. Diagnostica el equipo, le pone un puntaje de salud, sugiere qué reparar y aplica las reparaciones. Todo lo que hace queda registrado en un log.
 
@@ -69,17 +69,58 @@ Las **notas** (por ejemplo, "BitLocker activo" o "VPN conectada") son avisos inf
 | Sonido y dispositivos | Sonido, **micrófono y cámara**, **Bluetooth y USB**, impresora (vacía la cola y la pone en línea), reporte de batería |
 | Outlook y Office | Reparación rápida, modo seguro, "pide contraseña", reconstruir OST, reparar Office (rápida o en línea), panel de carpetas, perfiles de correo, **OneDrive**, **Teams** |
 | Seguridad | **Escaneo rápido, completo y sin conexión de Defender**, firmas, **activar firewall**, **ver la clave de recuperación de BitLocker** (solo en pantalla, no se guarda en el log) |
+| Formatear equipo | **Respaldar y restaurar los datos del cliente**, respaldar y restaurar drivers, **instalar programas** con winget |
+| Reportes | **Reporte de entrega para el cliente**, **reporte de atenciones** por período, historial en Excel, exportar e importar visitas |
 | Herramientas | Accesos directos a las herramientas de Windows |
 
 **Optimizar rendimiento** muestra los programas de inicio y usted elige cuáles desactivar. Funciona igual que en el Administrador de tareas, así que es reversible. También ofrece el plan de energía, los efectos visuales y desactivar el inicio rápido.
 
 En la versión de consola, estas reparaciones nuevas (incluidas las de drivers) están en la opción **17. Reparaciones avanzadas**.
 
-**Flujo recomendado para formatear un equipo:**
-1. Drivers > **Respaldar todos los drivers** a una USB.
-2. Formatee e instale Windows.
-3. Drivers > **Restaurar o instalar drivers desde carpeta/USB**.
-4. Para lo que siga sin driver: **Buscar drivers en Windows Update** y luego **Página de drivers del fabricante**.
+**Formatear un equipo (categoría Formatear equipo, en orden):**
+1. **Respaldar datos del cliente** a la USB o a un disco externo.
+2. **Respaldar todos los drivers.**
+3. Formatee e instale Windows. Entre con el usuario del cliente y abra la herramienta con permisos de administrador.
+4. **Restaurar drivers desde carpeta/USB.** Para lo que siga sin driver, use Drivers > **Buscar drivers en Windows Update** y luego **Página de drivers del fabricante**.
+5. **Restaurar datos del cliente.**
+6. **Instalar programas.**
+7. Reportes > **Reporte de entrega para el cliente.**
+
+### Respaldar y restaurar datos del cliente
+
+- **Qué copia:** Escritorio, Documentos, Imágenes, Descargas, Música y Videos del **usuario con sesión**, con su ubicación real aunque estén redirigidos. También los correos de Outlook (`.pst`) que estén fuera de Documentos, los favoritos de Chrome, Edge, Brave y Firefox, y las redes WiFi guardadas.
+- **OneDrive:** las carpetas que están en OneDrive aparecen sin marcar, porque ya están en la nube. Copiarlas haría bajar todos los archivos que solo están en línea.
+- **Redes WiFi:** se guardan con sus claves, pero **solo cifradas** en `Redes_WiFi.stv`, que únicamente abre esta herramienta con su contraseña. Los archivos con las claves en texto existen solo unos segundos en una carpeta temporal que se borra siempre.
+- **Antes de copiar** revisa que haya espacio suficiente y si el destino es FAT32, que no admite archivos de más de 4 GB. **No deja respaldar en el disco del sistema**, porque se perdería al formatear. Si hay `.pst`, cierra Outlook.
+- **El respaldo** queda en `Datos_<equipo>_<fecha>\`, con `manifiesto.txt`, `LEEME.txt` y `robocopy.log`. En la USB se guarda en `Clientes\<equipo>\`.
+- **Al restaurar** se listan los respaldos de todos los equipos de la USB y se marca el de este equipo por número de serie, porque después de formatear el nombre cambia.
+  - Se restaura en las carpetas del usuario con sesión. **No se borra nada ni se reemplazan archivos más nuevos.**
+  - Los `.pst` van a `Documentos\Archivos de Outlook`. Se abren en Outlook con Archivo > Abrir y exportar > Abrir archivo de datos de Outlook.
+  - Los favoritos de Chrome, Edge y Brave se restauran solos si el navegador ya se abrió una vez y está cerrado. Los de Firefox, o si no se pudo, quedan en el escritorio, en la carpeta "Favoritos respaldados", con instrucciones.
+
+### Instalar programas
+
+- Usa **winget**, el instalador oficial de Windows, y descarga la última versión de cada programa. Necesita internet.
+- **La lista se edita sin recompilar:** la primera vez se crea `Programas.txt` junto al `.exe` en la USB. Cada línea es `Nombre | Id de winget`. Para buscar un Id: `winget search <nombre>`.
+- **Antes de instalar** revisa si cada programa ya está, y al final muestra un resumen. Si un Id falla, el código de error se muestra en hexadecimal.
+- En un Windows recién instalado, winget puede tardar unos minutos en estar disponible. Si no aparece, la herramienta abre "Instalador de aplicación" en Microsoft Store para actualizarlo.
+
+## Reportes
+
+- **Reporte de entrega para el cliente:** una página para imprimir o guardar como PDF (Imprimir > Microsoft Print to PDF). Incluye:
+  - los datos del equipo;
+  - el **puntaje al recibir y al entregar**;
+  - los problemas resueltos, los trabajos realizados, los pendientes y recomendaciones, y las observaciones;
+  - espacio para la firma del técnico y del cliente.
+  Si no hubo un diagnóstico después de las reparaciones, ofrece hacerlo, para no mostrar un "antes y después" falso. Pide su nombre y contacto, y en la USB los recuerda en `Clientes\Tecnico.txt`. No incluye datos internos como el ID de AnyDesk.
+- **Reporte de atenciones:** lo atendido en un período (este mes, el anterior, los últimos 7 o 30 días, el año, todo o unas fechas). Se puede filtrar por cliente. Muestra:
+  - total de visitas, equipos, clientes y trabajos;
+  - mejora promedio del puntaje;
+  - tablas por cliente, trabajos más frecuentes, equipos atendidos y el detalle de cada visita.
+  Se guarda en `Clientes\Reportes\` como HTML y como CSV para Excel.
+- **Abrir el historial en Excel** abre `Historial.csv`.
+
+Sin la USB, el reporte de entrega se guarda en la carpeta Reportes, que se borra al cerrar. Por eso la herramienta pregunta si se deja una copia en el escritorio del cliente: es lo único que queda legible en su equipo.
 
 **Revertir el driver** solo funciona si la versión anterior sigue guardada en Windows. Si no, la herramienta lo avisa y propone las alternativas. Antes de revertir crea un punto de restauración.
 
