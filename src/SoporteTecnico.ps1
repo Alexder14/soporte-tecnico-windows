@@ -16,7 +16,7 @@ $Script:FuncionesIniciales = @(Get-ChildItem -Path function: | ForEach-Object { 
 $Script:ModoInterfaz = 'Grafica'
 if ($Consola) { $Script:ModoInterfaz = 'Consola' }
 
-$Script:Version = '2.7'
+$Script:Version = '2.8'
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -141,6 +141,7 @@ $Sync.Visita = [hashtable]::Synchronized(@{
         Acciones = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
         PuntajeAntes = $null; PuntajeDespues = $null; TareaActual = ''; Cliente = ''; Notas = ''
         Ficha = $null; AvisoAnterior = ''; ClienteAnterior = ''
+        Diagnosticos = 0; AlertasAntes = @(); AlertasDespues = @()
     })
 
 if ($Script:ModoInterfaz -eq 'Grafica') {
@@ -5388,8 +5389,11 @@ $Script:Catalogo = @(
     @{ Cat = 'Herramientas'; Titulo = 'Servicios'; Desc = 'Servicios de Windows.'; Cmd = "Abrir-Herramienta 'services'"; Ui = $true }
     @{ Cat = 'Herramientas'; Titulo = 'Carpeta de reportes'; Desc = 'Diagnósticos, respaldos y reportes.'; Cmd = "Abrir-Herramienta 'reportes'"; Ui = $true }
     @{ Cat = 'Herramientas'; Titulo = 'Abrir el log de esta sesión'; Desc = 'Todo lo que hizo la herramienta.'; Cmd = "Abrir-Herramienta 'log'"; Ui = $true }
-    @{ Cat = 'Herramientas'; Titulo = 'Exportar esta visita'; Desc = 'Trabajo remoto: guarda la visita en un archivo .stv cifrado para cargarlo después en su USB (se hace solo al cerrar si no está en la USB).'; Cmd = 'Exportar-Visita'; Avanzada = $true }
-    @{ Cat = 'Herramientas'; Titulo = 'Importar visitas remotas'; Desc = 'Carga en el historial de la USB los archivos .stv de visitas hechas sin la USB.'; Cmd = 'Importar-Visitas'; Avanzada = $true }
+    @{ Cat = 'Reportes'; Titulo = 'Reporte de entrega para el cliente'; Desc = 'Página para el cliente: estado del equipo antes y después, trabajos realizados y pendientes. Se imprime o se guarda como PDF.'; Cmd = 'New-ReporteEntrega'; Avanzada = $true }
+    @{ Cat = 'Reportes'; Titulo = 'Reporte de atenciones'; Desc = 'Lo atendido en un período (este mes, el anterior, fechas...): visitas, clientes, equipos y trabajos más frecuentes.'; Cmd = 'New-ReporteAtenciones'; Avanzada = $true }
+    @{ Cat = 'Reportes'; Titulo = 'Abrir el historial en Excel'; Desc = 'Todas las visitas (Historial.csv). Ciérrelo antes de terminar la visita.'; Cmd = 'Abrir-HistorialExcel'; Ui = $true; Avanzada = $true }
+    @{ Cat = 'Reportes'; Titulo = 'Exportar esta visita'; Desc = 'Trabajo remoto: guarda la visita en un archivo .stv cifrado para cargarlo después en su USB (se hace solo al cerrar si no está en la USB).'; Cmd = 'Exportar-Visita'; Avanzada = $true }
+    @{ Cat = 'Reportes'; Titulo = 'Importar visitas remotas'; Desc = 'Carga en el historial de la USB los archivos .stv de visitas hechas sin la USB.'; Cmd = 'Importar-Visitas'; Avanzada = $true }
 )
 
 function Mostrar-Avanzadas {
@@ -5492,7 +5496,8 @@ function Registrar-AccionVisita {
     $v = $Sync.Visita
     if (-not $v.Activa) { return }
     # 'Reparar lo encontrado' se anota paso por paso dentro de Invoke-ReparacionAutomatica
-    if ($Titulo -eq 'Datos del equipo') { return }
+    # Lo que solo consulta o genera reportes no es un trabajo hecho al equipo
+    if (@('Datos del equipo', 'Reporte de entrega para el cliente', 'Reporte de atenciones', 'Abrir el historial en Excel', 'Exportar esta visita', 'Importar visitas remotas') -contains $Titulo) { return }
     if ($Titulo -eq 'Reparar lo encontrado' -and $Estado -ne 'Interrumpida' -and $Estado -ne 'Error') { return }
     if ($Titulo -eq 'Diagnóstico completo') { $v.Diagnostico = $true }
     else {
@@ -5506,8 +5511,15 @@ function Registrar-PuntajeVisita {
     # Se llama al terminar cada diagnóstico: guarda el primer y el último puntaje de la visita.
     try {
         $p = (Get-PuntajeSalud).Puntaje
-        if ($null -eq $Sync.Visita.PuntajeAntes) { $Sync.Visita.PuntajeAntes = $p }
+        $alertas = @(Get-AlertasOrdenadas)
+        if ($null -eq $Sync.Visita.PuntajeAntes) {
+            $Sync.Visita.PuntajeAntes = $p
+            $Sync.Visita.AlertasAntes = $alertas
+        }
         $Sync.Visita.PuntajeDespues = $p
+        $Sync.Visita.AlertasDespues = $alertas
+        $Sync.Visita.Diagnosticos = [int]$Sync.Visita.Diagnosticos + 1
+        $Sync.Visita.Diagnostico = $true
     }
     catch { }
 }
@@ -6176,6 +6188,435 @@ function Iniciar-VisitaGui {
     catch { Write-Log ("No se pudo iniciar la ficha del equipo: {0}" -f $_.Exception.Message) 'ADVERTENCIA' -SoloArchivo }
 }
 
+#region ==================== REPORTES: ENTREGA AL CLIENTE Y ATENCIONES ====================
+
+function Elegir-Varias {
+    # Elige varios elementos de una lista numerada: "1,3,5-7", "todos" o vacío (= las predeterminadas).
+    # Devuelve los índices (desde 0). $null si se cancela en la ventana.
+    param([string]$Pregunta, [string[]]$Opciones, [int[]]$Predeterminadas = @())
+    $Opciones = @($Opciones)
+    if ($Opciones.Count -eq 0) { return @() }
+    $lineas = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $Opciones.Count; $i++) { $lineas.Add(('{0}. {1}' -f ($i + 1), $Opciones[$i])) }
+    $sugerido = (@($Predeterminadas) | ForEach-Object { $_ + 1 }) -join ','
+    $ayuda = 'Escriba los números separados por comas (por ejemplo 1,3,5-7) o "todos".'
+    if ($Script:ModoInterfaz -eq 'Grafica') {
+        $resp = Solicitar-Gui -Tipo 'Texto' -Texto (($lineas -join "`n") + "`n`n" + $Pregunta + "`n" + $ayuda) -Valor $sugerido
+        if ($Sync.Cancelado) { return $null }
+    }
+    else {
+        foreach ($l in $lineas) { Write-Host ("    {0}" -f $l) }
+        Write-Host ''
+        Write-Host ("    {0}" -f $ayuda) -ForegroundColor DarkGray
+        $textoEnter = ''
+        if ($sugerido) { $textoEnter = ' (Enter = {0})' -f $sugerido }
+        $resp = Read-Host ("  {0}{1}" -f $Pregunta, $textoEnter)
+        if (-not "$resp".Trim()) { $resp = $sugerido }
+    }
+    $texto = "$resp".Trim().ToLowerInvariant()
+    if ($texto -eq 'todos' -or $texto -eq 'todo') { return @(0..($Opciones.Count - 1)) }
+    $elegidos = New-Object System.Collections.Generic.List[int]
+    foreach ($parte in ($texto -split '[,; ]+' | Where-Object { $_ })) {
+        $a = 0; $b = 0
+        if ($parte -match '^(\d+)-(\d+)$' -and [int]::TryParse($Matches[1], [ref]$a) -and [int]::TryParse($Matches[2], [ref]$b)) {
+            for ($n = [math]::Min($a, $b); $n -le [math]::Max($a, $b); $n++) {
+                if ($n -ge 1 -and $n -le $Opciones.Count -and -not $elegidos.Contains($n - 1)) { $elegidos.Add($n - 1) }
+            }
+        }
+        elseif ([int]::TryParse($parte, [ref]$a) -and $a -ge 1 -and $a -le $Opciones.Count -and -not $elegidos.Contains($a - 1)) {
+            $elegidos.Add($a - 1)
+        }
+    }
+    return @($elegidos | Sort-Object)
+}
+
+function Get-CarpetaReportesGenerales {
+    # Reportes que no son de un solo equipo. USB: Clientes\Reportes | Sin USB: la carpeta Reportes
+    # (se borra al cerrar, porque en el equipo del cliente no debe quedar nada legible).
+    if ($Script:EnUsb) { $dir = Join-Path (Split-Path -Parent (Get-RutaHistorialGeneral)) 'Reportes' }
+    else { $dir = $Script:DirReportes }
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    return $dir
+}
+
+function Get-EstiloReporte {
+    # Estilo común (claro, apto para imprimir o guardar como PDF desde el navegador).
+    return @'
+<style>
+  body { font-family: "Segoe UI", Arial, sans-serif; color: #1e293b; margin: 0; background: #f1f5f9; }
+  .hoja { max-width: 960px; margin: 24px auto; background: #fff; padding: 32px 40px; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  h1 { font-size: 24px; margin: 0 0 4px 0; } h2 { font-size: 17px; margin: 28px 0 10px 0; border-bottom: 2px solid #e2e8f0; padding-bottom: 6px; }
+  .sub { color: #64748b; font-size: 13px; }
+  .cabecera { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
+  .tarjetas { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 14px; }
+  .tarjeta { flex: 1 1 150px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 14px; }
+  .tarjeta .n { font-size: 26px; font-weight: 700; } .tarjeta .t { font-size: 12px; color: #64748b; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; } th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
+  th { background: #f8fafc; font-weight: 600; } .ok { color: #15803d; } .mal { color: #b91c1c; } .aviso { color: #b45309; }
+  .barra { height: 10px; background: #e2e8f0; border-radius: 5px; overflow: hidden; } .barra div { height: 10px; }
+  ul { margin: 6px 0; padding-left: 20px; } li { margin: 3px 0; }
+  .firma { margin-top: 48px; display: flex; gap: 60px; } .firma div { flex: 1; border-top: 1px solid #94a3b8; padding-top: 6px; font-size: 12px; color: #64748b; text-align: center; }
+  .pie { margin-top: 28px; font-size: 11px; color: #94a3b8; }
+  @media print { body { background: #fff; } .hoja { box-shadow: none; margin: 0; } }
+</style>
+'@
+}
+
+function Get-ColorPuntaje {
+    param([int]$Puntaje)
+    if ($Puntaje -ge 80) { return '#16a34a' }
+    if ($Puntaje -ge 50) { return '#d97706' }
+    return '#dc2626'
+}
+
+function Get-TextoSinEstado {
+    # "Reparar sonido (OK)" -> "Reparar sonido"
+    param([string]$Accion)
+    return ("$Accion" -replace '\s*\((OK|con avisos o cancelado|ERROR|interrumpida)\)\s*$', '').Trim()
+}
+
+function Get-DatosTecnico {
+    # Nombre y contacto del técnico para el reporte de entrega. En la USB se recuerdan en Clientes\Tecnico.txt.
+    $archivo = Join-Path (Split-Path -Parent (Get-RutaHistorialGeneral)) 'Tecnico.txt'
+    $nombre = ''; $contacto = ''
+    if ($Script:EnUsb -and (Test-Path -LiteralPath $archivo)) {
+        foreach ($l in @(Get-Content -LiteralPath $archivo -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+            if ($l -match '^Nombre=(.*)$') { $nombre = $Matches[1].Trim() }
+            if ($l -match '^Contacto=(.*)$') { $contacto = $Matches[1].Trim() }
+        }
+    }
+    if ($Script:ModoInterfaz -eq 'Grafica') {
+        $n = Solicitar-Gui -Tipo 'Texto' -Texto 'Reporte de entrega: su nombre (técnico).' -Valor $nombre
+        if ($Sync.Cancelado) { return $null }
+        $c = Solicitar-Gui -Tipo 'Texto' -Texto 'Reporte de entrega: su teléfono o correo de contacto (opcional).' -Valor $contacto
+    }
+    else {
+        $n = Read-Host ("  Su nombre (técnico){0}" -f $(if ($nombre) { " (Enter = $nombre)" } else { '' }))
+        if (-not "$n".Trim()) { $n = $nombre }
+        $c = Read-Host ("  Su teléfono o correo{0}" -f $(if ($contacto) { " (Enter = $contacto)" } else { '' }))
+        if (-not "$c".Trim()) { $c = $contacto }
+    }
+    $r = [pscustomobject]@{ Nombre = "$n".Trim(); Contacto = "$c".Trim() }
+    if ($Script:EnUsb) {
+        try { [System.IO.File]::WriteAllLines($archivo, @("Nombre=$($r.Nombre)", "Contacto=$($r.Contacto)"), (New-Object System.Text.UTF8Encoding($true))) } catch { }
+    }
+    return $r
+}
+
+function Get-CarpetaUsuario {
+    # Ruta real de una carpeta del usuario con sesión (Escritorio, Documentos...), aunque esté redirigida
+    # (por ejemplo a OneDrive). Se lee su registro, no el del administrador con el que se elevó.
+    param($Perfil, [string]$Clave)
+    $ruta = ''
+    try {
+        $k = Get-Item -LiteralPath "$($Perfil.Registro)\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" -ErrorAction Stop
+        $ruta = "$($k.GetValue($Clave, '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames))"
+    }
+    catch { }
+    if ($ruta) {
+        # %USERPROFILE% debe ser el del usuario, no el del administrador
+        $ruta = [regex]::Replace($ruta, '%USERPROFILE%', ($Perfil.Ruta -replace '\$', '$$$$'), 'IgnoreCase')
+        $ruta = [Environment]::ExpandEnvironmentVariables($ruta)
+    }
+    if (-not $ruta) {
+        $predeterminadas = @{ 'Desktop' = 'Desktop'; 'Personal' = 'Documents'; 'My Pictures' = 'Pictures'; '{374DE290-123F-4565-9164-39C4925E467B}' = 'Downloads'; 'My Music' = 'Music'; 'My Video' = 'Videos' }
+        if ($predeterminadas.ContainsKey($Clave)) { $ruta = Join-Path $Perfil.Ruta $predeterminadas[$Clave] }
+    }
+    return $ruta.TrimEnd('\')
+}
+
+function New-ReporteEntrega {
+    # Reporte para el cliente: estado del equipo antes y después, qué se hizo y qué queda pendiente.
+    Mostrar-Titulo 'REPORTE DE ENTREGA PARA EL CLIENTE'
+    $v = $Sync.Visita
+    $diagnosticos = [int]$v.Diagnosticos
+    if ($diagnosticos -eq 0) {
+        Write-Host '    En esta visita no se hizo ningún diagnóstico: el reporte no tendría el estado del equipo.' -ForegroundColor Yellow
+    }
+    elseif ($diagnosticos -eq 1 -and $v.Acciones.Count -gt 0) {
+        Write-Host '    Solo hay un diagnóstico, hecho antes de las reparaciones: falta el "después".' -ForegroundColor Yellow
+    }
+    if (($diagnosticos -eq 0 -or ($diagnosticos -eq 1 -and $v.Acciones.Count -gt 0)) -and (Confirmar '¿Hacer ahora un diagnóstico final (1 o 2 minutos)?')) {
+        $null = Invoke-Diagnostico -SinPreguntas
+        if ($Script:ModoInterfaz -eq 'Grafica') { $null = Publicar-Diagnostico }
+        $diagnosticos = [int]$v.Diagnosticos
+    }
+
+    $cliente = "$($v.Cliente)"
+    if (-not $cliente) { $cliente = "$($v.ClienteAnterior)" }
+    if ($Script:ModoInterfaz -eq 'Grafica') {
+        $resp = Solicitar-Gui -Tipo 'Texto' -Texto 'Reporte de entrega: nombre del cliente.' -Valor $cliente
+        if ($Sync.Cancelado) { Write-Log 'Operación cancelada.' 'INFO'; return $false }
+    }
+    else {
+        $resp = Read-Host ("  Nombre del cliente{0}" -f $(if ($cliente) { " (Enter = $cliente)" } else { '' }))
+        if (-not "$resp".Trim()) { $resp = $cliente }
+    }
+    $cliente = "$resp".Trim()
+    if ($cliente) { $v.Cliente = $cliente }
+    $tecnico = Get-DatosTecnico
+    if ($null -eq $tecnico) { Write-Log 'Operación cancelada.' 'INFO'; return $false }
+
+    $f = $v.Ficha
+    $equipo = $env:COMPUTERNAME
+    $modelo = ''; $serie = "$($v.Serie)"
+    if ($f) { $modelo = ('{0} {1}' -f $f.Marca, $f.Modelo).Trim() }
+    $fecha = Get-Date
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Reporte de servicio técnico</title>')
+    [void]$sb.Append((Get-EstiloReporte))
+    [void]$sb.Append('</head><body><div class="hoja">')
+    [void]$sb.Append('<div class="cabecera"><div><h1>Reporte de servicio técnico</h1>')
+    [void]$sb.Append(('<div class="sub">{0}</div></div>' -f (Html $fecha.ToString('dd/MM/yyyy HH:mm'))))
+    [void]$sb.Append('<div style="text-align:right">')
+    if ($tecnico.Nombre) { [void]$sb.Append(('<b>{0}</b><br>' -f (Html $tecnico.Nombre))) }
+    if ($tecnico.Contacto) { [void]$sb.Append(('<span class="sub">{0}</span>' -f (Html $tecnico.Contacto))) }
+    [void]$sb.Append('</div></div>')
+
+    [void]$sb.Append('<h2>Equipo</h2><table>')
+    if ($cliente) { [void]$sb.Append(('<tr><th style="width:180px">Cliente</th><td>{0}</td></tr>' -f (Html $cliente))) }
+    [void]$sb.Append(('<tr><th style="width:180px">Equipo</th><td>{0}</td></tr>' -f (Html $equipo)))
+    if ($modelo) { [void]$sb.Append(('<tr><th>Marca y modelo</th><td>{0}</td></tr>' -f (Html $modelo))) }
+    if ($serie) { [void]$sb.Append(('<tr><th>Número de serie</th><td>{0}</td></tr>' -f (Html $serie))) }
+    if ($Script:InfoSO) { [void]$sb.Append(('<tr><th>Sistema</th><td>{0}</td></tr>' -f (Html $Script:InfoSO))) }
+    [void]$sb.Append('</table>')
+
+    # Estado del equipo: solo se muestra "antes -> después" si de verdad hubo dos diagnósticos
+    [void]$sb.Append('<h2>Estado del equipo</h2>')
+    if ($diagnosticos -ge 2 -and $null -ne $v.PuntajeAntes -and $null -ne $v.PuntajeDespues) {
+        $antes = [int]$v.PuntajeAntes; $despues = [int]$v.PuntajeDespues
+        [void]$sb.Append('<div class="tarjetas">')
+        [void]$sb.Append(('<div class="tarjeta"><div class="n" style="color:{0}">{1}/100</div><div class="t">Al recibir el equipo</div><div class="barra"><div style="width:{1}%;background:{0}"></div></div></div>' -f (Get-ColorPuntaje $antes), $antes))
+        [void]$sb.Append(('<div class="tarjeta"><div class="n" style="color:{0}">{1}/100</div><div class="t">Al entregar el equipo</div><div class="barra"><div style="width:{1}%;background:{0}"></div></div></div>' -f (Get-ColorPuntaje $despues), $despues))
+        $dif = $despues - $antes
+        $textoDif = 'Sin cambio en el puntaje'
+        if ($dif -gt 0) { $textoDif = "Mejoró $dif puntos" } elseif ($dif -lt 0) { $textoDif = "Bajó $([math]::Abs($dif)) puntos" }
+        [void]$sb.Append(('<div class="tarjeta"><div class="n">{0}{1}</div><div class="t">{2}</div></div>' -f $(if ($dif -gt 0) { '+' } else { '' }), $dif, (Html $textoDif)))
+        [void]$sb.Append('</div>')
+    }
+    elseif ($diagnosticos -ge 1 -and $null -ne $v.PuntajeDespues) {
+        $p = [int]$v.PuntajeDespues
+        [void]$sb.Append(('<div class="tarjetas"><div class="tarjeta"><div class="n" style="color:{0}">{1}/100</div><div class="t">Puntaje de salud del equipo</div><div class="barra"><div style="width:{1}%;background:{0}"></div></div></div></div>' -f (Get-ColorPuntaje $p), $p))
+        if ($v.Acciones.Count -gt 0) { [void]$sb.Append('<p class="sub">Este puntaje es de antes de los trabajos: no se hizo un diagnóstico final.</p>') }
+    }
+    else {
+        [void]$sb.Append('<p class="sub">No se hizo un diagnóstico del equipo en esta visita.</p>')
+    }
+
+    # Problemas resueltos y pendientes (se compara el primer diagnóstico con el último)
+    $limpiar = { param($a) ("$a" -replace '^\[(CRÍTICO|ALERTA|INFO)\]\s*', '').Trim() }
+    $antesLista = @($v.AlertasAntes | Where-Object { "$_" -notlike '`[INFO`]*' } | ForEach-Object { & $limpiar $_ })
+    $despuesLista = @($v.AlertasDespues | Where-Object { "$_" -notlike '`[INFO`]*' } | ForEach-Object { & $limpiar $_ })
+    if ($diagnosticos -ge 2) {
+        $resueltos = @($antesLista | Where-Object { $despuesLista -notcontains $_ })
+        if ($resueltos.Count -gt 0) {
+            [void]$sb.Append('<h2>Problemas resueltos</h2><ul>')
+            foreach ($r in $resueltos) { [void]$sb.Append(('<li class="ok">✔ {0}</li>' -f (Html $r))) }
+            [void]$sb.Append('</ul>')
+        }
+    }
+
+    [void]$sb.Append('<h2>Trabajos realizados</h2>')
+    $acciones = @($v.Acciones)
+    if ($acciones.Count -eq 0) { [void]$sb.Append('<p class="sub">Revisión y diagnóstico del equipo.</p>') }
+    else {
+        [void]$sb.Append('<ul>')
+        foreach ($a in $acciones) {
+            $nombre = Get-TextoSinEstado $a
+            if ("$a" -match '\(OK\)\s*$') { [void]$sb.Append(('<li class="ok">✔ {0}</li>' -f (Html $nombre))) }
+            else { [void]$sb.Append(('<li class="aviso">● {0} <span class="sub">(no se completó del todo)</span></li>' -f (Html $nombre))) }
+        }
+        [void]$sb.Append('</ul>')
+    }
+
+    if ($despuesLista.Count -gt 0) {
+        [void]$sb.Append('<h2>Pendientes y recomendaciones</h2><ul>')
+        foreach ($p in $despuesLista) { [void]$sb.Append(('<li>{0}</li>' -f (Html $p))) }
+        [void]$sb.Append('</ul>')
+    }
+    if ($v.Notas) { [void]$sb.Append(('<h2>Observaciones</h2><p>{0}</p>' -f (Html $v.Notas))) }
+
+    [void]$sb.Append('<div class="firma"><div>Técnico</div><div>Recibí conforme (cliente)</div></div>')
+    [void]$sb.Append(('<div class="pie">Generado por Soporte Técnico v{0}. Para guardarlo como PDF: Imprimir &gt; Microsoft Print to PDF.</div>' -f (Html $Script:Version)))
+    [void]$sb.Append('</div></body></html>')
+
+    try {
+        $archivo = Join-Path $Script:DirReportes ('Entrega_{0}_{1}.html' -f $env:COMPUTERNAME, $fecha.ToString('yyyyMMdd_HHmm'))
+        [System.IO.File]::WriteAllText($archivo, $sb.ToString(), (New-Object System.Text.UTF8Encoding($true)))
+        Write-Log "Reporte de entrega guardado en: $archivo" 'OK'
+    }
+    catch {
+        Write-Log "No se pudo guardar el reporte de entrega: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+    # Sin la USB la carpeta Reportes se borra al cerrar: si el cliente debe quedarse con el reporte, va a su escritorio
+    if (-not $Script:EnUsb -and (Confirmar '¿Dejar una copia del reporte en el escritorio del cliente? (es lo único que quedará legible en su equipo)')) {
+        try {
+            $escritorio = Get-CarpetaUsuario (Get-PerfilUsuarioActivo) 'Desktop'
+            $copia = Join-Path $escritorio ('Reporte de servicio técnico {0}.html' -f $fecha.ToString('yyyy-MM-dd'))
+            Copy-Item -LiteralPath $archivo -Destination $copia -Force -ErrorAction Stop
+            Write-Log "Copia en el escritorio del cliente: $copia" 'OK'
+            $archivo = $copia
+        }
+        catch { Write-Log "No se pudo copiar al escritorio: $($_.Exception.Message)" 'ADVERTENCIA' }
+    }
+    Abrir-ParaUsuario $archivo
+    return $true
+}
+
+function ConvertTo-FechaVisita {
+    param([string]$Texto)
+    $d = [datetime]::MinValue
+    if ([datetime]::TryParseExact("$Texto".Trim(), 'dd/MM/yyyy HH:mm', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { return $d }
+    return $null
+}
+
+function New-ReporteAtenciones {
+    # Resumen de lo atendido en un período: visitas, clientes, equipos, trabajos más frecuentes y mejora del puntaje.
+    Mostrar-Titulo 'REPORTE DE ATENCIONES'
+    $ruta = Get-RutaHistorialGeneral
+    if (-not (Test-Path -LiteralPath $ruta)) { Write-Log 'Todavía no hay visitas en el historial.' 'INFO'; return $false }
+    if (-not $Script:EnUsb) {
+        Write-Log 'La herramienta no se abrió desde la USB: el reporte incluye solo las visitas guardadas en este equipo.' 'ADVERTENCIA'
+    }
+    try { $todas = @(Import-Csv -LiteralPath $ruta -Encoding UTF8 -ErrorAction Stop) }
+    catch { Write-Log "No se pudo leer el historial (¿está abierto en Excel?): $($_.Exception.Message)" 'ERROR'; return $false }
+
+    $hoy = (Get-Date).Date
+    $inicioMes = Get-Date -Day 1 -Hour 0 -Minute 0 -Second 0 -Millisecond 0
+    $periodos = @(
+        @{ Nombre = 'Este mes'; Desde = $inicioMes; Hasta = $hoy.AddDays(1) },
+        @{ Nombre = 'Mes anterior'; Desde = $inicioMes.AddMonths(-1); Hasta = $inicioMes },
+        @{ Nombre = 'Últimos 7 días'; Desde = $hoy.AddDays(-6); Hasta = $hoy.AddDays(1) },
+        @{ Nombre = 'Últimos 30 días'; Desde = $hoy.AddDays(-29); Hasta = $hoy.AddDays(1) },
+        @{ Nombre = 'Este año'; Desde = (Get-Date -Month 1 -Day 1).Date; Hasta = $hoy.AddDays(1) },
+        @{ Nombre = 'Todo el historial'; Desde = [datetime]::MinValue; Hasta = [datetime]::MaxValue },
+        @{ Nombre = 'Elegir fechas...'; Desde = $null; Hasta = $null }
+    )
+    $i = Elegir-Opcion -Pregunta '  Período del reporte' -Opciones @($periodos | ForEach-Object { $_.Nombre })
+    if ($i -lt 0) { Write-Log 'Operación cancelada.' 'INFO'; return $false }
+    $periodo = $periodos[$i]
+    $desde = $periodo.Desde; $hasta = $periodo.Hasta; $nombrePeriodo = $periodo.Nombre
+    if ($null -eq $desde) {
+        $d1 = ConvertTo-FechaVisita ("{0} 00:00" -f "$(Read-Host '  Desde (dd/mm/aaaa)')".Trim())
+        $d2 = ConvertTo-FechaVisita ("{0} 00:00" -f "$(Read-Host '  Hasta (dd/mm/aaaa)')".Trim())
+        if ($null -eq $d1 -or $null -eq $d2) { Write-Log 'Fechas no válidas. Use el formato dd/mm/aaaa, por ejemplo 01/11/2026.' 'ERROR'; return $false }
+        $desde = $d1; $hasta = $d2.AddDays(1)
+        $nombrePeriodo = 'Del {0} al {1}' -f $d1.ToString('dd/MM/yyyy'), $d2.ToString('dd/MM/yyyy')
+    }
+    $filtroCliente = "$(Read-Host '  Cliente (parte del nombre; vacío = todos)')".Trim()
+
+    $filas = New-Object System.Collections.Generic.List[object]
+    foreach ($x in $todas) {
+        $fx = ConvertTo-FechaVisita $x.Fecha
+        if ($null -eq $fx -or $fx -lt $desde -or $fx -ge $hasta) { continue }
+        if ($filtroCliente -and "$($x.Cliente)" -notlike "*$filtroCliente*") { continue }
+        $x | Add-Member -NotePropertyName '_Fecha' -NotePropertyValue $fx -Force
+        $filas.Add($x)
+    }
+    if ($filas.Count -eq 0) { Write-Log ("No hay visitas en el período elegido ({0})." -f $nombrePeriodo) 'INFO'; return $false }
+    $filas = @($filas | Sort-Object -Property _Fecha)
+
+    # Cálculos
+    $claveEquipo = { param($x) if (Test-SerieValida $x.Serie) { "S:$($x.Serie)" } else { "N:$($x.Equipo)" } }
+    $equipos = @{}
+    $clientes = @{}
+    $trabajos = @{}
+    $mejoras = New-Object System.Collections.Generic.List[int]
+    foreach ($x in $filas) {
+        $ke = & $claveEquipo $x
+        if (-not $equipos.ContainsKey($ke)) { $equipos[$ke] = [pscustomobject]@{ Equipo = $x.Equipo; Modelo = ('{0} {1}' -f $x.Marca, $x.Modelo).Trim(); Serie = $x.Serie; Cliente = $x.Cliente; Visitas = 0; Ultima = $x._Fecha } }
+        $e = $equipos[$ke]; $e.Visitas++; $e.Ultima = $x._Fecha; $e.Equipo = $x.Equipo; if ($x.Cliente) { $e.Cliente = $x.Cliente }
+        $kc = "$($x.Cliente)".Trim(); if (-not $kc) { $kc = '(sin nombre)' }
+        if (-not $clientes.ContainsKey($kc)) { $clientes[$kc] = [pscustomobject]@{ Cliente = $kc; Visitas = 0; Equipos = @{}; Ultima = $x._Fecha } }
+        $c = $clientes[$kc]; $c.Visitas++; $c.Equipos[$ke] = $true; $c.Ultima = $x._Fecha
+        foreach ($a in @("$($x.Acciones)" -split '; ' | Where-Object { $_ })) {
+            $t = Get-TextoSinEstado $a
+            if (-not $trabajos.ContainsKey($t)) { $trabajos[$t] = [pscustomobject]@{ Trabajo = $t; Veces = 0; Ok = 0 } }
+            $trabajos[$t].Veces++
+            if ($a -match '\(OK\)\s*$') { $trabajos[$t].Ok++ }
+        }
+        $pa = 0; $pd = 0
+        if ([int]::TryParse("$($x.PuntajeAntes)", [ref]$pa) -and [int]::TryParse("$($x.PuntajeDespues)", [ref]$pd) -and "$($x.PuntajeAntes)" -ne "$($x.PuntajeDespues)") { $mejoras.Add($pd - $pa) }
+    }
+    $promedioMejora = $null
+    if ($mejoras.Count -gt 0) { $promedioMejora = [math]::Round((($mejoras | Measure-Object -Sum).Sum / $mejoras.Count), 1) }
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Reporte de atenciones</title>')
+    [void]$sb.Append((Get-EstiloReporte))
+    [void]$sb.Append('</head><body><div class="hoja">')
+    $titulo = 'Reporte de atenciones'
+    if ($filtroCliente) { $titulo += ' - ' + $filtroCliente }
+    [void]$sb.Append(('<h1>{0}</h1><div class="sub">{1} · generado el {2}</div>' -f (Html $titulo), (Html $nombrePeriodo), (Html (Get-Date -Format 'dd/MM/yyyy HH:mm'))))
+    [void]$sb.Append('<div class="tarjetas">')
+    [void]$sb.Append(('<div class="tarjeta"><div class="n">{0}</div><div class="t">Visitas</div></div>' -f $filas.Count))
+    [void]$sb.Append(('<div class="tarjeta"><div class="n">{0}</div><div class="t">Equipos atendidos</div></div>' -f $equipos.Count))
+    [void]$sb.Append(('<div class="tarjeta"><div class="n">{0}</div><div class="t">Clientes</div></div>' -f $clientes.Count))
+    $totalTrabajos = 0; foreach ($t in $trabajos.Values) { $totalTrabajos += $t.Veces }
+    [void]$sb.Append(('<div class="tarjeta"><div class="n">{0}</div><div class="t">Trabajos realizados</div></div>' -f $totalTrabajos))
+    if ($null -ne $promedioMejora) { [void]$sb.Append(('<div class="tarjeta"><div class="n">{0}{1}</div><div class="t">Mejora promedio del puntaje ({2} visitas con antes y después)</div></div>' -f $(if ($promedioMejora -gt 0) { '+' } else { '' }), $promedioMejora, $mejoras.Count)) }
+    [void]$sb.Append('</div>')
+
+    [void]$sb.Append('<h2>Por cliente</h2><table><tr><th>Cliente</th><th>Visitas</th><th>Equipos</th><th>Última visita</th></tr>')
+    foreach ($c in @($clientes.Values | Sort-Object -Property Visitas -Descending)) {
+        [void]$sb.Append(('<tr><td>{0}</td><td>{1}</td><td>{2}</td><td>{3}</td></tr>' -f (Html $c.Cliente), $c.Visitas, $c.Equipos.Count, (Html $c.Ultima.ToString('dd/MM/yyyy'))))
+    }
+    [void]$sb.Append('</table>')
+
+    if ($trabajos.Count -gt 0) {
+        [void]$sb.Append('<h2>Trabajos más frecuentes</h2><table><tr><th>Trabajo</th><th>Veces</th><th>Completados</th></tr>')
+        foreach ($t in @($trabajos.Values | Sort-Object -Property Veces -Descending | Select-Object -First 25)) {
+            [void]$sb.Append(('<tr><td>{0}</td><td>{1}</td><td>{2}</td></tr>' -f (Html $t.Trabajo), $t.Veces, $t.Ok))
+        }
+        [void]$sb.Append('</table>')
+    }
+
+    [void]$sb.Append('<h2>Equipos atendidos</h2><table><tr><th>Equipo</th><th>Marca y modelo</th><th>Serie</th><th>Cliente</th><th>Visitas</th><th>Última</th></tr>')
+    foreach ($e in @($equipos.Values | Sort-Object -Property Ultima -Descending)) {
+        [void]$sb.Append(('<tr><td>{0}</td><td>{1}</td><td>{2}</td><td>{3}</td><td>{4}</td><td>{5}</td></tr>' -f (Html $e.Equipo), (Html $e.Modelo), (Html $e.Serie), (Html $e.Cliente), $e.Visitas, (Html $e.Ultima.ToString('dd/MM/yyyy'))))
+    }
+    [void]$sb.Append('</table>')
+
+    [void]$sb.Append('<h2>Detalle de visitas</h2><table><tr><th>Fecha</th><th>Cliente</th><th>Equipo</th><th>Puntaje</th><th>Trabajos</th><th>Notas</th></tr>')
+    foreach ($x in $filas) {
+        $puntaje = ''
+        if ("$($x.PuntajeAntes)") { $puntaje = "$($x.PuntajeAntes)"; if ("$($x.PuntajeDespues)" -and "$($x.PuntajeDespues)" -ne "$($x.PuntajeAntes)") { $puntaje += ' → ' + $x.PuntajeDespues } }
+        $lista = (@("$($x.Acciones)" -split '; ' | Where-Object { $_ } | ForEach-Object { Html $_ }) -join '<br>')
+        [void]$sb.Append(('<tr><td>{0}</td><td>{1}</td><td>{2}</td><td>{3}</td><td>{4}</td><td>{5}</td></tr>' -f (Html $x.Fecha), (Html $x.Cliente), (Html $x.Equipo), (Html $puntaje), $lista, (Html $x.Notas)))
+    }
+    [void]$sb.Append('</table>')
+    [void]$sb.Append(('<div class="pie">Generado por Soporte Técnico v{0} a partir de {1}.</div>' -f (Html $Script:Version), (Html $ruta)))
+    [void]$sb.Append('</div></body></html>')
+
+    try {
+        $dir = Get-CarpetaReportesGenerales
+        $base = 'Atenciones_{0}' -f (Get-Date -Format 'yyyyMMdd_HHmm')
+        $html = Join-Path $dir "$base.html"
+        [System.IO.File]::WriteAllText($html, $sb.ToString(), (New-Object System.Text.UTF8Encoding($true)))
+        # Las mismas visitas en CSV (mismo formato que Historial.csv), para Excel
+        $columnas = @($todas[0].PSObject.Properties.Name | Where-Object { $_ -ne '_Fecha' })
+        $filas | Select-Object -Property $columnas | Export-Csv -LiteralPath (Join-Path $dir "$base.csv") -NoTypeInformation -Encoding UTF8
+        Write-Log ("Reporte de atenciones: {0} visitas. Guardado en {1} (y .csv para Excel)." -f $filas.Count, $html) 'OK'
+    }
+    catch {
+        Write-Log "No se pudo guardar el reporte: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+    Abrir-ParaUsuario $html
+    return $true
+}
+
+function Abrir-HistorialExcel {
+    $ruta = Get-RutaHistorialGeneral
+    if (-not (Test-Path -LiteralPath $ruta)) { Write-Log 'Todavía no hay visitas en el historial.' 'INFO'; return }
+    Abrir-ParaUsuario $ruta
+    Write-Log 'Cierre Excel antes de terminar la visita: si el historial está abierto no se puede actualizar.' 'INFO'
+}
+
+#endregion
+
 #region ==================== INTERFAZ GRÁFICA: DISEÑO (XAML) ====================
 
 $Script:XamlPrincipal = @'
@@ -6432,6 +6873,7 @@ $Script:CategoriasGui = [ordered]@{
     'Sonido y dispositivos' = @{ Icono = 0xE767; Desc = 'Audio, micrófono, cámara, Bluetooth, USB, impresoras y batería.' }
     'Outlook y Office'      = @{ Icono = 0xE715; Desc = 'Outlook, Office, OneDrive y Teams.' }
     'Seguridad'             = @{ Icono = 0xEA18; Desc = 'Antivirus, firewall y BitLocker.' }
+    'Reportes'              = @{ Icono = 0xE9F9; Desc = 'Reporte de entrega para el cliente, reporte de lo atendido por período e historial de visitas.' }
     'Herramientas'          = @{ Icono = 0xE90F; Desc = 'Accesos directos a las herramientas de Windows (se abren al instante, aunque haya una tarea en curso).' }
 }
 
@@ -6510,15 +6952,15 @@ function Agregar-LogGui {
 }
 
 function Solicitar-Gui {
-    # Pide una respuesta al usuario desde cualquier hilo.
-    param([string]$Tipo, [string]$Texto)
+    # Pide una respuesta al usuario desde cualquier hilo. $Valor = texto que aparece ya escrito.
+    param([string]$Tipo, [string]$Texto, [string]$Valor = '')
     if ($Sync.HiloUI -eq [System.Threading.Thread]::CurrentThread.ManagedThreadId) {
         $Sync.Cancelado = $false
-        return [string](Mostrar-DialogoGui @{ Tipo = $Tipo; Texto = $Texto })
+        return [string](Mostrar-DialogoGui @{ Tipo = $Tipo; Texto = $Texto; Valor = $Valor })
     }
     $Sync.Respuesta = $null
     $Sync.Cancelado = $false
-    $Sync.Pregunta = @{ Tipo = $Tipo; Texto = $Texto }
+    $Sync.Pregunta = @{ Tipo = $Tipo; Texto = $Texto; Valor = $Valor }
     while ($null -eq $Sync.Respuesta) { Start-Sleep -Milliseconds 150 }
     $r = [string]$Sync.Respuesta
     $Sync.Respuesta = $null
