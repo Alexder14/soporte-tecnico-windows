@@ -546,6 +546,176 @@ else {
 }
 
 # =====================================================================
+Grupo 'Cancelar tarea'
+# =====================================================================
+function Esperar-Hasta {
+    param([scriptblock]$Condicion, [int]$Segundos = 10)
+    $fin = (Get-Date).AddSeconds($Segundos)
+    while ((Get-Date) -lt $fin) { if (& $Condicion) { return $true }; Start-Sleep -Milliseconds 200 }
+    return [bool](& $Condicion)
+}
+$cmdExe = Join-Path $env:windir 'System32\cmd.exe'
+$pingExe = Join-Path $env:windir 'System32\ping.exe'
+Caso 'Stop-ArbolProceso termina un programa y los que lanzó' {
+    $p = Start-Process -FilePath $cmdExe -ArgumentList '/c ping -n 60 127.0.0.1 > nul' -WindowStyle Hidden -PassThru
+    $Script:HijoPrueba = 0
+    try {
+        $vio = Esperar-Hasta {
+            $h = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($p.Id)" -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'PING.EXE' })
+            if ($h.Count -gt 0) { $Script:HijoPrueba = $h[0].ProcessId; $true } else { $false }
+        } 8
+        Afirmar $vio 'No apareció el programa hijo de prueba.'
+        Afirmar (Stop-ArbolProceso -Id $p.Id -Nombre 'cmd') 'Stop-ArbolProceso devolvió falso.'
+        Afirmar (Esperar-Hasta { -not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) } 5) 'El programa sigue vivo.'
+        Afirmar (Esperar-Hasta { -not (Get-Process -Id $Script:HijoPrueba -ErrorAction SilentlyContinue) } 5) 'El programa que este lanzó (ping) sigue vivo.'
+    }
+    finally {
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        if ($Script:HijoPrueba) { Stop-Process -Id $Script:HijoPrueba -Force -ErrorAction SilentlyContinue }
+    }
+}
+Caso 'Stop-ArbolProceso no toca un programa de otro nombre (número reutilizado por Windows)' {
+    $p = Start-Process -FilePath $pingExe -ArgumentList '-n 30 127.0.0.1' -WindowStyle Hidden -PassThru
+    try {
+        Afirmar (-not (Stop-ArbolProceso -Id $p.Id -Nombre 'otro_programa')) 'Debía rechazar un nombre distinto.'
+        Afirmar (-not $p.HasExited) 'Terminó un programa que no debía.'
+    }
+    finally { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+}
+Caso 'Stop-ArbolProceso con un programa que ya no existe no falla' {
+    Afirmar (Stop-ArbolProceso -Id 999999 -Nombre 'nada') 'Debía devolver verdadero (ya no queda nada que detener).'
+}
+Caso 'Cancelar: detiene la tarea y el programa que lanzó (como con DISM o SFC)' {
+    $salidasAntes = @(Get-ChildItem -LiteralPath $env:TEMP -Filter 'soporte_*.txt' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $Sync.Cola = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+    $Sync.ProcesosTarea = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.Open()
+    $ps = $null
+    $idPing = 0
+    try {
+        # Un espacio de ejecución aparte, con las mismas funciones que usa la herramienta y el mismo $Sync
+        $defs = @{}
+        foreach ($n in 'Invoke-NativoGui', 'Leer-SalidaNativa', 'Get-RutaSistema') { $defs[$n] = (Get-Item "function:$n").Definition }
+        $ini = [powershell]::Create()
+        $ini.Runspace = $rs
+        [void]$ini.AddScript('param($d, $s) foreach ($k in $d.Keys) { Set-Item -Path ("function:global:{0}" -f $k) -Value ([scriptblock]::Create($d[$k])) }; $global:Sync = $s; function global:Write-Log { param($m, $n, [switch]$SoloArchivo) }; function global:Write-Host { param([Parameter(ValueFromRemainingArguments = $true)]$o, $ForegroundColor) }').AddArgument($defs).AddArgument($Sync)
+        [void]$ini.Invoke()
+        $ini.Dispose()
+        $ps = [powershell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript("Invoke-NativoGui -Archivo '$pingExe' -Argumentos '-n 40 127.0.0.1' -Descripcion 'ping de prueba'")
+        $Sync.PsActual = $ps
+        $null = $ps.BeginInvoke()
+        Afirmar (Esperar-Hasta { $Sync.ProcesosTarea.Count -ge 1 } 10) 'La tarea no anotó el programa que lanzó (Invoke-NativoGui no lo registra).'
+        $reg = $Sync.ProcesosTarea[0]
+        $idPing = $reg.Id
+        Afirmar ($reg.Nombre -ieq 'ping') "El nombre anotado es [$($reg.Nombre)] y debía ser ping."
+        Afirmar ($null -ne (Get-Process -Id $idPing -ErrorAction SilentlyContinue)) 'El programa no está en marcha antes de cancelar.'
+        $asinc = Detener-TareaActual
+        Afirmar ($null -ne $asinc) 'Detener-TareaActual no devolvió el resultado de la detención.'
+        Afirmar (Esperar-Hasta { "$($ps.InvocationStateInfo.State)" -eq 'Stopped' } 12) "La tarea no se detuvo (estado: $($ps.InvocationStateInfo.State))."
+        Afirmar (-not (Get-Process -Id $idPing -ErrorAction SilentlyContinue)) 'El programa que lanzó la tarea sigue vivo.'
+        Afirmar (Esperar-Hasta { $Sync.ProcesosTarea.Count -eq 0 } 3) 'El registro de programas no quedó vacío.'
+        $sobran = @(Get-ChildItem -LiteralPath $env:TEMP -Filter 'soporte_*.txt' -ErrorAction SilentlyContinue | Where-Object { $salidasAntes -notcontains $_.Name })
+        Afirmar ($sobran.Count -eq 0) "Cancelar dejó $($sobran.Count) archivo(s) temporal(es) de salida en la carpeta temporal (soporte_*.txt)."
+    }
+    finally {
+        if ($idPing) { Stop-Process -Id $idPing -Force -ErrorAction SilentlyContinue }
+        try { if ($ps) { $ps.Dispose() } } catch { }
+        try { $rs.Dispose() } catch { }
+        $Sync.PsActual = $null
+    }
+}
+Caso 'Cancelar: no arranca el paso siguiente de la tarea (DISM y luego SFC)' {
+    $marca = Join-Path $env:TEMP ('probar_marca_{0}.txt' -f [guid]::NewGuid().ToString('N'))
+    $Sync.Cola = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+    $Sync.ProcesosTarea = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.Open()
+    $ps = $null
+    try {
+        $defs = @{}
+        foreach ($n in 'Invoke-NativoGui', 'Leer-SalidaNativa', 'Get-RutaSistema') { $defs[$n] = (Get-Item "function:$n").Definition }
+        $ini = [powershell]::Create()
+        $ini.Runspace = $rs
+        [void]$ini.AddScript('param($d, $s) foreach ($k in $d.Keys) { Set-Item -Path ("function:global:{0}" -f $k) -Value ([scriptblock]::Create($d[$k])) }; $global:Sync = $s; function global:Write-Log { param($m, $n, [switch]$SoloArchivo) }; function global:Write-Host { param([Parameter(ValueFromRemainingArguments = $true)]$o, $ForegroundColor) }').AddArgument($defs).AddArgument($Sync)
+        [void]$ini.Invoke()
+        $ini.Dispose()
+        # Paso 1: un programa largo. Paso 2: un programa que deja una marca en un archivo si llega a arrancar.
+        $ps = [powershell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript("Invoke-NativoGui -Archivo '$pingExe' -Argumentos '-n 40 127.0.0.1' -Descripcion 'paso 1'; Invoke-NativoGui -Archivo '$cmdExe' -Argumentos '/c echo paso2 > ""$marca""' -Descripcion 'paso 2'")
+        $Sync.PsActual = $ps
+        $null = $ps.BeginInvoke()
+        Afirmar (Esperar-Hasta { $Sync.ProcesosTarea.Count -ge 1 } 10) 'La tarea no arrancó el paso 1.'
+        [void](Detener-TareaActual)
+        Afirmar (Esperar-Hasta { "$($ps.InvocationStateInfo.State)" -eq 'Stopped' } 12) "La tarea no quedó detenida (estado: $($ps.InvocationStateInfo.State)); si quedó Completed, siguió con el paso 2."
+        Start-Sleep -Milliseconds 1500
+        Afirmar (-not (Test-Path -LiteralPath $marca)) 'Arrancó el paso 2 después de cancelar: al matar el programa, la tarea siguió sola.'
+    }
+    finally {
+        Remove-Item -LiteralPath $marca -Force -ErrorAction SilentlyContinue
+        foreach ($r in @($Sync.ProcesosTarea)) { Stop-Process -Id $r.Id -Force -ErrorAction SilentlyContinue }
+        try { if ($ps) { $ps.Dispose() } } catch { }
+        try { $rs.Dispose() } catch { }
+        $Sync.PsActual = $null
+    }
+}
+if ($Rapido -or $SinVentanas) {
+    Omitir 'Cancelar: botón y cierre de la cancelación en la ventana' 'omitida por -Rapido / -SinVentanas'
+}
+else {
+    Caso 'Cancelar: el botón aparece solo con una tarea y la cancelación termina bien en la ventana' {
+        $v = [System.Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader ([xml]$xamls['XamlPrincipal'])))
+        $g = @{ Ventana = $v; HayAcciones = $false }
+        foreach ($n in @('Progreso', 'BarraTareas', 'TxtEstado', 'BtnDiagnostico', 'BtnCompleta', 'BtnRepararTodo', 'PanelAcciones', 'BtnCancelarTarea', 'Log')) { $g[$n] = $v.FindName($n) }
+        $Script:Gui = $g
+        $Script:ColoresLog = @{}
+        $Sync.Cola = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+        $Sync.ProcesosTarea = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+        Afirmar ($null -ne $g.BtnCancelarTarea) 'No existe BtnCancelarTarea en la ventana.'
+        Afirmar ($g.BtnCancelarTarea.Visibility -eq 'Collapsed') 'El botón debe estar oculto cuando no hay tarea.'
+        Set-OcupadoGui $true 'Tarea de prueba'
+        Afirmar ($g.BtnCancelarTarea.Visibility -eq 'Visible') 'El botón debe verse mientras hay una tarea.'
+        Afirmar (-not $g.BtnDiagnostico.IsEnabled) 'Analizar debe quedar deshabilitado mientras hay una tarea.'
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.Open()
+        $ps = [powershell]::Create()
+        $ps.Runspace = $rs
+        try {
+            [void]$ps.AddScript('Start-Sleep -Seconds 60')
+            $Sync.PsActual = $ps
+            $Sync.Visita = @{ Activa = $false; TareaActual = 'Tarea de prueba'; Acciones = (New-Object System.Collections.ArrayList); PuntajeAntes = $null; PuntajeDespues = $null; Ficha = $null }
+            $Sync.Pregunta = @{ Tipo = 'SiNo'; Texto = 'pendiente' }
+            $null = $ps.BeginInvoke()
+            Start-Sleep -Milliseconds 400
+            $g.TareaTitulo = 'Tarea de prueba'
+            $g.Cancelando = $true
+            $g.InicioCancelacion = Get-Date
+            [void](Detener-TareaActual)
+            $fin = (Get-Date).AddSeconds(15)
+            while ($g.Cancelando -and (Get-Date) -lt $fin) { Verificar-Cancelacion; Start-Sleep -Milliseconds 200 }
+            Afirmar (-not $g.Cancelando) 'La cancelación no terminó en 15 segundos.'
+            Afirmar (-not $Sync.Ocupado) 'Después de cancelar la herramienta sigue "ocupada".'
+            Afirmar ($g.BtnCancelarTarea.Visibility -eq 'Collapsed') 'El botón debía ocultarse al terminar la cancelación.'
+            Afirmar ($g.BtnDiagnostico.IsEnabled) 'Analizar debía volver a habilitarse.'
+            Afirmar ($g.TxtEstado.Text -like '*Cancelada*') "Texto de estado: [$($g.TxtEstado.Text)]."
+            Afirmar ($null -eq $Sync.PsActual) 'Quedó una tarea activa registrada.'
+            Afirmar ($Sync.Visita.TareaActual -eq '') 'La tarea cancelada quedó como "en curso" en la visita.'
+            Afirmar ($null -eq $Sync.Pregunta) 'Quedó una pregunta pendiente de la tarea cancelada.'
+        }
+        finally {
+            try { $ps.Dispose() } catch { }
+            try { $rs.Dispose() } catch { }
+            $Sync.Visita = @{ Ficha = $null; Acciones = (New-Object System.Collections.ArrayList); PuntajeAntes = $null; PuntajeDespues = $null; Activa = $false }
+            $Sync.PsActual = $null
+            $Sync.Ocupado = $false
+        }
+    }
+}
+
+# =====================================================================
 Grupo 'Compilación (aislada, con un ps2exe falso)'
 # =====================================================================
 if ($Rapido) {

@@ -135,6 +135,8 @@ $Sync.Ocupado = $false
 $Sync.HiloUI = -1
 $Sync.Diagnostico = $null
 $Sync.PsActual = $null
+# Programas que lanzó la tarea en curso (Id y nombre), para poder detenerlos al cancelar
+$Sync.ProcesosTarea = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
 $Sync.ClaveExportacion = $null
 $Sync.SinArchivosLocales = $false
 $Sync.Visita = [hashtable]::Synchronized(@{
@@ -323,6 +325,9 @@ function Invoke-NativoGui {
         if ($Argumentos) { $parametros['ArgumentList'] = $Argumentos }
         $proceso = Start-Process @parametros
         $null = $proceso.Handle
+        # Se anota para que "Cancelar tarea" pueda detenerlo (DISM, SFC y compañía siguen solos si no)
+        $registro = [pscustomobject]@{ Id = $proceso.Id; Nombre = "$($proceso.ProcessName)" }
+        [void]$Sync.ProcesosTarea.Add($registro)
         $lector = New-Object PSObject -Property @{ Posicion = [long]0; Unicode = $null; Pendiente = '' }
         while (-not $proceso.HasExited) {
             Start-Sleep -Milliseconds 700
@@ -345,6 +350,14 @@ function Invoke-NativoGui {
         return -1
     }
     finally {
+        # Si se cancela la tarea, este bloque corre antes de que se termine el programa: se espera un momento a
+        # que muera y suelte el archivo de salida. Mientras siga vivo se queda anotado, para poder terminarlo.
+        $vivo = $false
+        if ($proceso) {
+            try { if (-not $proceso.HasExited) { [void]$proceso.WaitForExit(5000) } } catch { }
+            try { $vivo = -not $proceso.HasExited } catch { }
+        }
+        if ($registro -and -not $vivo) { try { $Sync.ProcesosTarea.Remove($registro) } catch { } }
         Remove-Item -LiteralPath $salidaTmp -Force -ErrorAction SilentlyContinue
     }
 }
@@ -7509,6 +7522,9 @@ $Script:XamlPrincipal = @'
           <DockPanel Margin="16,0">
             <ProgressBar x:Name="Progreso" DockPanel.Dock="Right" Width="200" Height="6" Foreground="#3B82F6"
                          Background="#1E293B" BorderThickness="0" VerticalAlignment="Center"/>
+            <Button x:Name="BtnCancelarTarea" DockPanel.Dock="Right" Content="✖ Cancelar tarea" Style="{StaticResource Secundario}"
+                    Padding="12,2" FontSize="11" Foreground="#FCA5A5" Margin="0,3,16,3" Visibility="Collapsed"
+                    ToolTip="Detiene la tarea en curso y los programas que lanzó (DISM, SFC, copias...). Lo que ya se cambió no se deshace."/>
             <TextBlock x:Name="TxtEstado" Text="Listo" Foreground="#94A3B8" VerticalAlignment="Center" FontSize="12"
                        TextTrimming="CharacterEllipsis" Margin="0,0,16,0"/>
           </DockPanel>
@@ -8246,12 +8262,119 @@ function Set-OcupadoGui {
     }
     catch { }
     if ($Ocupado) { $Script:Gui.TxtEstado.Text = "Trabajando en: $Titulo... (puede tardar unos minutos, no cierre la ventana)" }
+    # El botón "Cancelar tarea" solo aparece mientras hay una tarea en curso
+    try {
+        $bc = $Script:Gui.BtnCancelarTarea
+        if ($Ocupado) { $bc.Visibility = [System.Windows.Visibility]::Visible }
+        else { $bc.Visibility = [System.Windows.Visibility]::Collapsed }
+        $bc.IsEnabled = $true
+        $bc.Content = '✖ Cancelar tarea'
+    }
+    catch { }
     $Script:Gui.BtnDiagnostico.IsEnabled = -not $Ocupado
     $Script:Gui.BtnCompleta.IsEnabled = -not $Ocupado
     $Script:Gui.BtnRepararTodo.IsEnabled = (-not $Ocupado) -and $Script:Gui.HayAcciones
     foreach ($b in $Script:Gui.PanelAcciones.Children) {
         if ($b.Tag -and -not $b.Tag.Ui) { $b.IsEnabled = -not $Ocupado }
     }
+}
+
+function Stop-ArbolProceso {
+    # Termina un programa y todo lo que lanzó (DISM abre procesos auxiliares). Comprueba el nombre para no
+    # terminar otro programa si Windows reutilizó el número. Devuelve $true si ya no queda.
+    param([int]$Id, [string]$Nombre = '')
+    try {
+        $p = Get-Process -Id $Id -ErrorAction Stop
+        if ($Nombre -and $p.ProcessName -ne $Nombre) { return $false }
+    }
+    catch { return $true }
+    try {
+        $tk = Start-Process -FilePath (Get-RutaSistema 'taskkill.exe') -ArgumentList ('/PID {0} /T /F' -f $Id) -WindowStyle Hidden -Wait -PassThru -ErrorAction Stop
+        if ($tk.ExitCode -eq 0) { return $true }
+    }
+    catch { }
+    try { Stop-Process -Id $Id -Force -ErrorAction Stop; return $true }
+    catch { return $false }
+}
+
+function Detener-TareaActual {
+    # Núcleo de "Cancelar tarea" (sin ventanas): detiene la tarea y termina los programas que lanzó.
+    # IMPORTANTE: primero se da la orden de parar la tarea y después se matan los programas. Al revés, al morir
+    # DISM la tarea seguiría sola con el paso siguiente (SFC) antes de recibir la orden.
+    # Devuelve el resultado asíncrono de la detención, o $null si no había tarea.
+    $ps = $Sync.PsActual
+    $asinc = $null
+    if ($ps) { try { $asinc = $ps.BeginStop($null, $null) } catch { } }
+    foreach ($r in @($Sync.ProcesosTarea)) { [void](Stop-ArbolProceso -Id $r.Id -Nombre $r.Nombre) }
+    return $asinc
+}
+
+function Cancelar-TareaGui {
+    if (-not $Script:Sync.Ocupado -or $Script:Gui.Cancelando) { return }
+    $titulo = "$($Script:Gui.TareaTitulo)"
+    $texto = ("¿Cancelar '{0}'?`n`nSe detiene ahora, junto con los programas que lanzó (DISM, SFC, copias...). Lo que ya se cambió no se deshace.`n`nUn escaneo de Defender o un CHKDSK en línea puede seguir unos minutos por su cuenta." -f $titulo)
+    $r = Mostrar-DialogoGui @{ Tipo = 'SiNo'; Texto = $texto }
+    if ($r -ne 'Si') { return }
+    if (-not $Script:Sync.Ocupado) { return }   # la tarea terminó mientras decidía
+    $Script:Gui.Cancelando = $true
+    $Script:Gui.InicioCancelacion = Get-Date
+    $Script:Gui.BtnCancelarTarea.IsEnabled = $false
+    $Script:Gui.BtnCancelarTarea.Content = 'Cancelando...'
+    $Script:Gui.TxtEstado.Text = "Cancelando: $titulo..."
+    Agregar-LogGui ("✖ Cancelando: {0}..." -f $titulo) 'Yellow'
+    Write-Log ("El técnico canceló la tarea: {0}" -f $titulo) 'ADVERTENCIA' -SoloArchivo
+    [void](Detener-TareaActual)
+}
+
+function Verificar-Cancelacion {
+    # Lo llama el temporizador de la ventana mientras se cancela: espera a que la tarea termine de detenerse.
+    if (-not $Script:Sync.Ocupado) { $Script:Gui.Cancelando = $false; return }
+    $ps = $Script:Sync.PsActual
+    $estado = ''
+    if ($ps) { try { $estado = "$($ps.InvocationStateInfo.State)" } catch { } }
+    $terminada = (-not $ps) -or (@('Stopped', 'Completed', 'Failed') -contains $estado)
+    $espera = ((Get-Date) - $Script:Gui.InicioCancelacion).TotalSeconds
+    if (-not $terminada -and $espera -lt 15) { return }
+    Finalizar-Cancelacion -Forzada (-not $terminada)
+}
+
+function Finalizar-Cancelacion {
+    param([bool]$Forzada)
+    $titulo = "$($Script:Gui.TareaTitulo)"
+    $ps = $Script:Sync.PsActual
+    $Script:Sync.PsActual = $null
+    if ($ps) {
+        if ($Forzada) {
+            # La tarea no se dejó interrumpir (un cmdlet largo): se abandona y las siguientes usan un espacio nuevo
+            try { $Script:RunspaceGui = New-RunspaceGui } catch { }
+        }
+        else {
+            try { $ps.Dispose() } catch { }
+        }
+    }
+    $Script:Sync.Pregunta = $null
+    $Script:Sync.Respuesta = $null
+    # Barrido final: si la tarea alcanzó a lanzar algo más antes de detenerse, se termina también
+    foreach ($r in @($Script:Sync.ProcesosTarea)) { [void](Stop-ArbolProceso -Id $r.Id -Nombre $r.Nombre) }
+    $Script:Sync.ProcesosTarea.Clear()
+    # Lo que la tarea alcanzó a escribir antes de detenerse
+    $m = $null
+    $n = 0
+    while ($n -lt 500 -and $Script:Sync.Cola.TryDequeue([ref]$m)) {
+        $n++
+        try { if ($m.Tipo -eq 'Log') { Agregar-LogGui $m.Texto $m.Color } } catch { }
+    }
+    if ($Script:Sync.Visita.TareaActual -eq $titulo) {
+        $Script:Sync.Visita.TareaActual = ''
+        try { Registrar-AccionVisita $titulo 'Interrumpida' } catch { }
+    }
+    $Script:Gui.Cancelando = $false
+    Set-OcupadoGui $false
+    $extra = ''
+    if ($Forzada) { $extra = ' (la tarea tardó en responder y puede seguir unos segundos en segundo plano)' }
+    Agregar-LogGui ("✖ Tarea cancelada: {0}{1}" -f $titulo, $extra) 'Yellow'
+    $Script:Gui.TxtEstado.Text = "✖ Cancelada: $titulo"
+    Write-Log ("Tarea cancelada: {0}" -f $titulo) 'ADVERTENCIA' -SoloArchivo
 }
 
 function Ejecutar-TareaGui {
@@ -8261,6 +8384,8 @@ function Ejecutar-TareaGui {
         return
     }
     Set-OcupadoGui $true $Titulo
+    $Script:Gui.TareaTitulo = $Titulo
+    $Script:Gui.Cancelando = $false
     $Script:Gui.InicioTarea = Get-Date
     Agregar-LogGui '' 'Gray'
     Agregar-LogGui ("▶ {0}" -f $Titulo) 'White'
@@ -8281,6 +8406,7 @@ function Finalizar-TareaGui {
         $ps.Dispose()
         $Script:Sync.PsActual = $null
     }
+    $Script:Gui.Cancelando = $false
     Set-OcupadoGui $false
     if ($Mensaje.Ok) { $Script:Gui.TxtEstado.Text = "✔ Listo: $($Mensaje.Texto)" }
     else { $Script:Gui.TxtEstado.Text = "⚠ Terminó con avisos o se canceló: $($Mensaje.Texto). Revise el registro de actividad." }
@@ -8318,6 +8444,7 @@ function Procesar-ColaGui {
             $Script:Gui.Timer.Start()
         }
     }
+    if ($Script:Gui.Cancelando) { try { Verificar-Cancelacion } catch { } }
 }
 
 function Mostrar-Categoria {
@@ -8435,7 +8562,7 @@ function Iniciar-InterfazGrafica {
     $nombres = @('Principal', 'PanelLogin', 'TxtClave', 'TxtErrorClave', 'BtnEntrar', 'TxtEquipo', 'TxtVersion', 'PanelNav',
         'PaginaInicio', 'PaginaCategoria', 'TxtSubtitulo', 'ArcoPuntaje', 'TxtPuntaje', 'BordeEstado', 'TxtEstadoSalud', 'TxtResumen',
         'BtnDiagnostico', 'BtnRepararTodo', 'BtnReporte', 'BtnCompleta', 'ListaAlertas', 'ListaSugerencias', 'PanelTarjetas',
-        'TxtCategoria', 'TxtCategoriaDesc', 'PanelAcciones', 'Log', 'BtnLimpiarLog', 'Progreso', 'TxtEstado', 'GuiaInicio', 'BtnResumen', 'BarraTareas')
+        'TxtCategoria', 'TxtCategoriaDesc', 'PanelAcciones', 'Log', 'BtnLimpiarLog', 'Progreso', 'TxtEstado', 'GuiaInicio', 'BtnResumen', 'BarraTareas', 'BtnCancelarTarea')
     foreach ($n in $nombres) { $Script:Gui[$n] = $ventana.FindName($n) }
 
     $ventana.Title = "Soporte Técnico v$($Script:Version) - $env:COMPUTERNAME"
@@ -8472,6 +8599,7 @@ function Iniciar-InterfazGrafica {
     $Script:Gui.BtnRepararTodo.Add_Click({ Ejecutar-TareaGui -Titulo 'Reparar lo encontrado' -Comando 'Invoke-ReparacionAutomatica' })
     $Script:Gui.BtnCompleta.Add_Click({ Ejecutar-TareaGui -Titulo 'Reparación completa' -Comando 'Invoke-ReparacionCompleta' })
     $Script:Gui.BtnResumen.Add_Click({ Copiar-ResumenGui })
+    $Script:Gui.BtnCancelarTarea.Add_Click({ Cancelar-TareaGui })
     # Al volver a la ventana se quita el rojo de la barra de tareas (si no hay una tarea en curso)
     $ventana.Add_Activated({
             try { if (-not $Script:Sync.Ocupado) { $Script:Gui.BarraTareas.ProgressState = [System.Windows.Shell.TaskbarItemProgressState]::None } } catch { }
@@ -8493,7 +8621,7 @@ function Iniciar-InterfazGrafica {
 
     $ventana.Add_Closing({
             if ($Script:Sync.Ocupado -and -not $Script:Gui.CerrarSinPreguntar) {
-                $r = Mostrar-DialogoGui @{ Tipo = 'SiNo'; Texto = 'Hay una tarea en curso. Si cierra ahora se interrumpe (DISM o SFC pueden seguir solos en segundo plano). ¿Cerrar de todas formas?' }
+                $r = Mostrar-DialogoGui @{ Tipo = 'SiNo'; Texto = 'Hay una tarea en curso. Si cierra ahora se interrumpe (DISM o SFC pueden seguir solos en segundo plano). Para detenerla bien, cancélela antes con el botón "Cancelar tarea" de abajo. ¿Cerrar de todas formas?' }
                 if ($r -ne 'Si') { $_.Cancel = $true; return }
             }
             if ($Script:Gui.CerrarSinPreguntar -or -not $Script:Gui.AccesoOk) { return }

@@ -31,6 +31,7 @@ Las dos versiones piden permisos de administrador por sí solas y usan la misma 
 Solo se ejecuta una tarea a la vez. Las **Herramientas** (Administrador de dispositivos, Visor de eventos, etc.) se abren aunque haya una tarea en curso.
 
 - **Copiar resumen** (en Inicio): copia al portapapeles un texto corto con el equipo, la serie, el puntaje, los problemas y lo reparado en la visita, para pegarlo en el ticket o en un mensaje.
+- **Cancelar tarea:** mientras corre una tarea aparece el botón **✖ Cancelar tarea** en la barra de abajo. Pide confirmación y detiene la tarea **y los programas que lanzó** (DISM, SFC, copias de respaldo, etc.). Lo que la tarea ya cambió no se deshace, y la visita anota la tarea como interrumpida. Un escaneo de Defender o un CHKDSK en línea puede seguir unos minutos por su cuenta.
 - **Aviso al terminar:** si una tarea de más de 10 segundos termina con la ventana en segundo plano, el icono parpadea en la barra de tareas y suena un aviso. Mientras corre, la barra de tareas muestra el progreso; si termina con avisos, queda en rojo hasta que vuelva a la ventana.
 - **Elegir de una lista:** cuando una acción pide elegir (impresora, dispositivo, actualización a desinstalar, unidad del disco, drivers de Windows Update), se abre una ventana con la lista, con botones de selección o casillas. En la consola se sigue eligiendo por número.
 
