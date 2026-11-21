@@ -1446,7 +1446,23 @@ function Revisar-Disco {
     Mostrar-Titulo 'REVISAR DISCO (CHKDSK)'
     $predeterminada = $env:SystemDrive.TrimEnd(':')
     $letra = ''
-    if (-not $Automatico) { $letra = Read-Host ("  Letra de la unidad a revisar [{0}]" -f $predeterminada) }
+    if (-not $Automatico) {
+        if ($Script:ModoInterfaz -eq 'Grafica') {
+            # En la ventana: si hay más de un disco, se elige de una lista (con el espacio libre de cada uno)
+            $volumenes = @(Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and "$($_.DriveType)" -eq 'Fixed' } | Sort-Object -Property DriveLetter)
+            if ($volumenes.Count -gt 1) {
+                $opciones = @($volumenes | ForEach-Object {
+                        '{0}:   {1}   ({2} GB libres de {3} GB)' -f $_.DriveLetter, $_.FileSystemLabel, [math]::Round($_.SizeRemaining / 1GB), [math]::Round($_.Size / 1GB)
+                    })
+                $idx = Elegir-Opcion -Pregunta '' -Opciones $opciones -TextoGui 'Elija la unidad que quiere revisar.' -Titulo 'Revisar disco'
+                if ($idx -lt 0) { Write-Log 'Revisión de disco cancelada.' 'INFO'; return $false }
+                $letra = "$($volumenes[$idx].DriveLetter)"
+            }
+        }
+        else {
+            $letra = Read-Host ("  Letra de la unidad a revisar [{0}]" -f $predeterminada)
+        }
+    }
     if (-not $letra) { $letra = $predeterminada }
     $letra = $letra.Trim().TrimEnd(':', '\').ToUpper()
     if ($letra -notmatch '^[A-Z]$') {
@@ -3808,21 +3824,20 @@ function Desinstalar-Actualizacion {
         return $false
     }
     if ($paquetes.Count -eq 0) { Write-Log 'No se encontraron actualizaciones para desinstalar.' 'INFO'; return $false }
-    for ($i = 0; $i -lt $paquetes.Count; $i++) {
-        $p = $paquetes[$i]
+    $opciones = New-Object System.Collections.Generic.List[string]
+    foreach ($p in $paquetes) {
         $nombre = 'Actualización'
         if ($p.PackageName -match '(KB\d+)') { $nombre = $Matches[1] } elseif ($p.PackageName -match 'RollupFix') { $nombre = 'Actualización acumulativa' }
-        Write-Host ("    {0,2}. {1}  {2,-26} {3}" -f ($i + 1), $p.InstallTime.ToString('dd/MM/yyyy'), $nombre, $p.PackageName)
+        $opciones.Add(("{0}   {1}   {2}" -f $p.InstallTime.ToString('dd/MM/yyyy'), $nombre, $p.PackageName))
     }
     Write-Host ''
     Write-Host '    Desinstale solo si el problema empezó justo después de esa fecha.' -ForegroundColor Yellow
-    $resp = Read-Host '  Número de la actualización a desinstalar (Enter = cancelar)'
-    $n = 0
-    if (-not [int]::TryParse("$resp", [ref]$n) -or $n -lt 1 -or $n -gt $paquetes.Count) {
+    $idx = Elegir-Opcion -Pregunta '  Número de la actualización a desinstalar (Enter = cancelar)' -Opciones @($opciones) -TextoGui 'Elija la actualización a desinstalar. Hágalo solo si el problema empezó justo después de su fecha. Requiere reiniciar.' -Titulo 'Desinstalar una actualización'
+    if ($idx -lt 0) {
         Write-Log 'Desinstalación cancelada.' 'INFO'
         return $false
     }
-    $elegido = $paquetes[$n - 1]
+    $elegido = $paquetes[$idx]
     if (-not (Confirmar ("¿Desinstalar {0}? Requiere reiniciar." -f $elegido.PackageName))) { return $false }
     $null = New-PuntoRestauracion
     try {
@@ -4510,16 +4525,15 @@ function Buscar-DriversWindowsUpdate {
         }
     }
     else {
-        $resp = Read-Host '  Números a instalar separados por coma, "todos", o Enter para cancelar'
-        if ("$resp".Trim() -match '^(todos|t)$') {
-            foreach ($x in $lista) { $elegidos.Add($x) }
-        }
-        else {
-            foreach ($parte in ("$resp" -split '[,; ]+')) {
-                $n = 0
-                if ([int]::TryParse($parte, [ref]$n) -and $n -ge 1 -and $n -le $lista.Count) { $elegidos.Add($lista[$n - 1]) }
-            }
-        }
+        $opciones = @(for ($i = 0; $i -lt $lista.Count; $i++) {
+                $x = $lista[$i]
+                $marca = ''
+                if ($x.Corrige) { $marca = "   [CORRIGE: $($x.Corrige)]" }
+                '{0} ({1}, {2}){3}' -f $x.Titulo, $x.Clase, $x.Fecha, $marca
+            })
+        $marcadas = @(for ($i = 0; $i -lt $lista.Count; $i++) { if ($lista[$i].Corrige) { $i } })
+        $sel = @(Elegir-Opciones -Pregunta '  Números a instalar separados por coma, "todos", o Enter para cancelar' -Opciones $opciones -Marcadas $marcadas -TextoGui 'Marque los drivers a instalar. Los que corrigen un dispositivo con problema salen en verde y ya vienen marcados.' -Titulo 'Drivers de Windows Update')
+        foreach ($i in $sel) { $elegidos.Add($lista[$i]) }
         if ($elegidos.Count -eq 0) { Write-Log 'Instalación de drivers cancelada.' 'INFO'; return $false }
     }
 
@@ -4658,7 +4672,7 @@ function Get-ListaDispositivosElegibles {
 }
 
 function Elegir-Dispositivo {
-    param([string]$Pregunta)
+    param([string]$Pregunta, [string]$TextoGui = '')
     $lista = @(Get-ListaDispositivosElegibles)
     if ($lista.Count -eq 0) { Write-Log 'No hay dispositivos para elegir.' 'INFO'; return $null }
     if ($Script:ModoInterfaz -eq 'Grafica') {
@@ -4670,7 +4684,7 @@ function Elegir-Dispositivo {
                 if ([int]$d.ConfigManagerErrorCode -ne 0) { $estado = '   <- ' + (Get-DescripcionCodigoPnp $d.ConfigManagerErrorCode) }
                 '[{0}] {1}{2}' -f $d.Class, $nombre, $estado
             })
-        $idx = Elegir-Opcion $Pregunta $opciones
+        $idx = Elegir-Opcion -Pregunta $Pregunta -Opciones $opciones -TextoGui $TextoGui -Titulo 'Elegir dispositivo'
         if ($idx -ge 0) { return $lista[$idx] }
         Write-Log 'Operación cancelada.' 'INFO'
         return $null
@@ -4700,7 +4714,7 @@ function Reinstalar-Dispositivo {
     }
     Write-Host '    Se quita el dispositivo y Windows lo vuelve a detectar con su driver (los problemas aparecen primero).' -ForegroundColor DarkGray
     Write-Host ''
-    $d = Elegir-Dispositivo '  Número del dispositivo a reinstalar (Enter = cancelar)'
+    $d = Elegir-Dispositivo -Pregunta '  Número del dispositivo a reinstalar (Enter = cancelar)' -TextoGui 'Elija el dispositivo a reinstalar. Los que tienen un problema aparecen primero.'
     if (-not $d) { return $false }
     if ("$($d.Class)" -eq 'Net') { Mostrar-AvisoSesionRemota }
     if ("$($d.Class)" -in @('Keyboard', 'Mouse', 'HIDClass', 'USB')) {
@@ -4732,7 +4746,7 @@ function Revertir-Driver {
     Mostrar-Titulo 'REVERTIR EL DRIVER DE UN DISPOSITIVO'
     Write-Host '    Vuelve a la versión anterior del driver si todavía está guardada en el equipo.' -ForegroundColor DarkGray
     Write-Host ''
-    $d = Elegir-Dispositivo '  Número del dispositivo cuyo driver quiere revertir (Enter = cancelar)'
+    $d = Elegir-Dispositivo -Pregunta '  Número del dispositivo cuyo driver quiere revertir (Enter = cancelar)' -TextoGui 'Elija el dispositivo cuyo driver quiere revertir a la versión anterior.'
     if (-not $d) { return $false }
     try {
         $actual = Get-CimInstance -ClassName Win32_PnPSignedDriver -ErrorAction Stop | Where-Object { $_.DeviceID -eq $d.InstanceId } | Select-Object -First 1
@@ -4876,24 +4890,55 @@ function Abrir-PaginaFabricante {
 #region ==================== PAQUETE C: IMPRESORA, WINDOWS UPDATE Y PERFIL ====================
 
 function Elegir-Opcion {
-    # Elige un elemento de una lista numerada. En la ventana la lista va DENTRO del cuadro de diálogo
-    # (no solo en el registro de actividad). Devuelve el índice (desde 0) o -1 si se cancela o no es válido.
-    param([string]$Pregunta, [string[]]$Opciones)
+    # Elige UNA opción de una lista. En la ventana se abre un cuadro con la lista y botones de selección;
+    # en consola, una lista numerada. Devuelve el índice (desde 0) o -1 si se cancela o no es válido.
+    # $TextoGui: instrucción para el cuadro (si falta, se usa $Pregunta sin el "(Enter = cancelar)").
+    param([string]$Pregunta, [string[]]$Opciones, [string]$TextoGui = '', [string]$Titulo = 'Elegir')
     $Opciones = @($Opciones)
     if ($Opciones.Count -eq 0) { return -1 }
-    $lineas = New-Object System.Collections.Generic.List[string]
-    for ($i = 0; $i -lt $Opciones.Count; $i++) { $lineas.Add(('{0}. {1}' -f ($i + 1), $Opciones[$i])) }
     if ($Script:ModoInterfaz -eq 'Grafica') {
-        $resp = Solicitar-Gui -Tipo 'Texto' -Texto (($lineas -join "`n") + "`n`n" + $Pregunta)
+        if (-not $TextoGui) { $TextoGui = ($Pregunta -replace '\s*\((?:Enter|Cancelar)[^)]*\)', '').Trim() }
+        $resp = Solicitar-Gui -Tipo 'Lista' -Texto $TextoGui -Extra @{ Opciones = $Opciones; Multi = $false; Titulo = $Titulo }
+        $i = 0
+        if ([int]::TryParse("$resp".Trim(), [ref]$i) -and $i -ge 0 -and $i -lt $Opciones.Count) { return $i }
+        return -1
     }
-    else {
-        foreach ($l in $lineas) { Write-Host ("    {0}" -f $l) }
-        Write-Host ''
-        $resp = Read-Host $Pregunta
-    }
+    for ($i = 0; $i -lt $Opciones.Count; $i++) { Write-Host ("    {0}. {1}" -f ($i + 1), $Opciones[$i]) }
+    Write-Host ''
+    $resp = Read-Host $Pregunta
     $n = 0
     if ([int]::TryParse("$resp".Trim(), [ref]$n) -and $n -ge 1 -and $n -le $Opciones.Count) { return ($n - 1) }
     return -1
+}
+
+function Elegir-Opciones {
+    # Elige VARIAS opciones de una lista. En la ventana, casillas (las de $Marcadas vienen marcadas y en verde);
+    # en consola, números separados por coma o "todos". Devuelve un arreglo de índices (vacío si se cancela).
+    param([string]$Pregunta, [string[]]$Opciones, [int[]]$Marcadas = @(), [string]$TextoGui = '', [string]$Titulo = 'Elegir')
+    $Opciones = @($Opciones)
+    if ($Opciones.Count -eq 0) { return @() }
+    $elegidos = New-Object System.Collections.Generic.List[int]
+    if ($Script:ModoInterfaz -eq 'Grafica') {
+        $resp = Solicitar-Gui -Tipo 'Lista' -Texto $TextoGui -Extra @{ Opciones = $Opciones; Multi = $true; Marcadas = @($Marcadas); Titulo = $Titulo }
+        foreach ($parte in ("$resp" -split ',')) {
+            $i = 0
+            if ([int]::TryParse($parte.Trim(), [ref]$i) -and $i -ge 0 -and $i -lt $Opciones.Count) { $elegidos.Add($i) }
+        }
+        return @($elegidos)
+    }
+    for ($i = 0; $i -lt $Opciones.Count; $i++) { Write-Host ("    {0}. {1}" -f ($i + 1), $Opciones[$i]) }
+    Write-Host ''
+    $resp = Read-Host $Pregunta
+    if ("$resp".Trim() -match '^(todos|t)$') {
+        for ($i = 0; $i -lt $Opciones.Count; $i++) { $elegidos.Add($i) }
+    }
+    else {
+        foreach ($parte in ("$resp" -split '[,; ]+')) {
+            $n = 0
+            if ([int]::TryParse($parte, [ref]$n) -and $n -ge 1 -and $n -le $Opciones.Count) { $elegidos.Add($n - 1) }
+        }
+    }
+    return @($elegidos)
 }
 
 function Set-ValorDword {
@@ -4997,7 +5042,7 @@ function Reinstalar-Impresora {
     if ($impresoras.Count -eq 0) { Write-Log 'No hay impresoras físicas ni de red instaladas.' 'INFO'; return $true }
 
     $opciones = @($impresoras | ForEach-Object { '{0}   (puerto {1}, driver {2})' -f $_.Name, $_.PortName, $_.DriverName })
-    $idx = Elegir-Opcion 'Número de la impresora a reinstalar (Cancelar = salir)' $opciones
+    $idx = Elegir-Opcion -Pregunta 'Número de la impresora a reinstalar (Cancelar = salir)' -Opciones $opciones -TextoGui 'Elija la impresora que quiere quitar y volver a agregar.' -Titulo 'Reinstalar impresora'
     if ($idx -lt 0) { Write-Log 'Operación cancelada.' 'INFO'; return $false }
     $p = $impresoras[$idx]
     $nombre = "$($p.Name)"
@@ -7324,6 +7369,10 @@ $Script:XamlPrincipal = @'
     </Style>
   </Window.Resources>
 
+  <Window.TaskbarItemInfo>
+    <TaskbarItemInfo x:Name="BarraTareas"/>
+  </Window.TaskbarItemInfo>
+
   <Grid>
     <Grid x:Name="Principal">
       <Grid.ColumnDefinitions>
@@ -7383,6 +7432,7 @@ $Script:XamlPrincipal = @'
                       <Button x:Name="BtnRepararTodo" Content="Reparar lo encontrado" Style="{StaticResource Exito}" Margin="0,0,10,8" IsEnabled="False"/>
                       <Button x:Name="BtnReporte" Content="Ver reporte" Style="{StaticResource Secundario}" Margin="0,0,10,8" IsEnabled="False" ToolTip="Abre el reporte del último análisis en el navegador (se habilita después de analizar)."/>
                       <Button x:Name="BtnCompleta" Content="Reparación completa" Style="{StaticResource Secundario}" Margin="0,0,10,8" ToolTip="Aplica en bloque las reparaciones generales (archivos de Windows, red, limpieza). Es más lento. Pide confirmación."/>
+                      <Button x:Name="BtnResumen" Content="Copiar resumen" Style="{StaticResource Secundario}" Margin="0,0,10,8" ToolTip="Copia al portapapeles un resumen corto (equipo, puntaje, problemas y lo reparado) para pegarlo en el ticket o en un mensaje."/>
                     </WrapPanel>
                   </StackPanel>
                 </Grid>
@@ -7586,14 +7636,17 @@ function Agregar-LogGui {
 
 function Solicitar-Gui {
     # Pide una respuesta al usuario desde cualquier hilo. $Valor = texto que aparece ya escrito.
-    param([string]$Tipo, [string]$Texto, [string]$Valor = '')
+    # $Extra: datos adicionales para el cuadro (por ejemplo Opciones, Multi, Marcadas y Titulo del tipo 'Lista').
+    param([string]$Tipo, [string]$Texto, [string]$Valor = '', [hashtable]$Extra)
+    $pregunta = @{ Tipo = $Tipo; Texto = $Texto; Valor = $Valor }
+    if ($Extra) { foreach ($k in $Extra.Keys) { $pregunta[$k] = $Extra[$k] } }
     if ($Sync.HiloUI -eq [System.Threading.Thread]::CurrentThread.ManagedThreadId) {
         $Sync.Cancelado = $false
-        return [string](Mostrar-DialogoGui @{ Tipo = $Tipo; Texto = $Texto; Valor = $Valor })
+        return [string](Mostrar-DialogoGui $pregunta)
     }
     $Sync.Respuesta = $null
     $Sync.Cancelado = $false
-    $Sync.Pregunta = @{ Tipo = $Tipo; Texto = $Texto; Valor = $Valor }
+    $Sync.Pregunta = $pregunta
     while ($null -eq $Sync.Respuesta) { Start-Sleep -Milliseconds 150 }
     $r = [string]$Sync.Respuesta
     $Sync.Respuesta = $null
@@ -7604,6 +7657,7 @@ function Mostrar-DialogoGui {
     param($Pregunta)
     $tipo = "$($Pregunta.Tipo)"
     if ($tipo -eq 'Inicio') { Mostrar-InicioGui; return 'OK' }
+    if ($tipo -eq 'Lista') { return (Mostrar-ListaGui $Pregunta) }
     [xml]$x = $Script:XamlDialogo
     $dlg = [System.Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
     $titulo = $dlg.FindName('Titulo')
@@ -7840,10 +7894,220 @@ function Publicar-Diagnostico {
     return $true
 }
 
+$Script:XamlLista = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Elegir" Width="660" Height="540" MinWidth="460" MinHeight="320"
+        WindowStartupLocation="CenterOwner" Background="#0B1120" Foreground="#E2E8F0" FontFamily="Segoe UI" FontSize="13" ShowInTaskbar="False">
+  <Grid Margin="22">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <StackPanel Grid.Row="0">
+      <TextBlock x:Name="Titulo" FontSize="20" FontWeight="SemiBold" Foreground="#F8FAFC" TextWrapping="Wrap"/>
+      <TextBlock x:Name="Mensaje" Foreground="#94A3B8" Margin="0,6,0,14" TextWrapping="Wrap"/>
+    </StackPanel>
+    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+      <StackPanel x:Name="Lista" Margin="0,0,10,0"/>
+    </ScrollViewer>
+    <DockPanel Grid.Row="2" Margin="0,14,0,0">
+      <Button x:Name="BtnTodos" DockPanel.Dock="Left" Content="Marcar todos" Visibility="Collapsed" Margin="0,0,14,0"/>
+      <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+        <Button x:Name="BtnCancelar" Content="Cancelar" MinWidth="100" Margin="0,0,10,0" IsCancel="True"/>
+        <Button x:Name="BtnAceptar" Content="Aceptar" MinWidth="100" IsDefault="True"/>
+      </StackPanel>
+      <TextBlock x:Name="TxtAviso" Foreground="#FACC15" VerticalAlignment="Center" TextWrapping="Wrap" Margin="0,0,14,0"/>
+    </DockPanel>
+  </Grid>
+</Window>
+'@
+
+function Mostrar-ListaGui {
+    # Ventana con una lista para elegir UNA opción (botones de selección) o VARIAS (casillas).
+    # Devuelve los índices elegidos separados por coma ('2' o '0,3,5'), o '' si se cancela.
+    param($Pregunta)
+    [xml]$x = $Script:XamlLista
+    $w = [System.Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
+    $multi = [bool]$Pregunta.Multi
+    $g = @{ Ventana = $w; Multi = $multi; Resultado = '' }
+    foreach ($n in @('Titulo', 'Mensaje', 'Lista', 'BtnTodos', 'BtnCancelar', 'BtnAceptar', 'TxtAviso')) { $g[$n] = $w.FindName($n) }
+    $Script:ListaGui = $g
+    $titulo = "$($Pregunta.Titulo)"
+    if (-not $titulo) { $titulo = 'Elegir' }
+    $w.Title = $titulo
+    $g.Titulo.Text = $titulo
+    $g.Mensaje.Text = "$($Pregunta.Texto)"
+    try {
+        $g.BtnAceptar.Style = $Script:Gui.Ventana.FindResource('Primario')
+        $g.BtnCancelar.Style = $Script:Gui.Ventana.FindResource('Secundario')
+        $g.BtnTodos.Style = $Script:Gui.Ventana.FindResource('Secundario')
+    }
+    catch { }
+    $marcadas = @(@($Pregunta.Marcadas) | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ })
+    $opciones = @($Pregunta.Opciones)
+    for ($i = 0; $i -lt $opciones.Count; $i++) {
+        $resaltada = ($marcadas -contains $i)
+        if ($multi) { $ctl = New-Object System.Windows.Controls.CheckBox; $ctl.IsChecked = $resaltada }
+        else { $ctl = New-Object System.Windows.Controls.RadioButton; $ctl.GroupName = 'opciones' }
+        $color = '#E2E8F0'
+        if ($resaltada) { $color = '#4ADE80' }
+        $ctl.Content = Nuevo-TextoGui "$($opciones[$i])" 13 $color
+        $ctl.Tag = $i
+        $ctl.VerticalContentAlignment = [System.Windows.VerticalAlignment]::Top
+        $borde = New-Object System.Windows.Controls.Border
+        $borde.Background = Get-ColorPincel '#111827'
+        $borde.CornerRadius = New-Object System.Windows.CornerRadius(8)
+        $borde.Padding = New-Object System.Windows.Thickness(12, 9, 12, 9)
+        $borde.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+        $borde.Child = $ctl
+        [void]$g.Lista.Children.Add($borde)
+    }
+    if ($multi) {
+        $g.BtnTodos.Visibility = [System.Windows.Visibility]::Visible
+        $g.BtnTodos.Content = 'Quitar todos'
+        if ($marcadas.Count -lt $opciones.Count) { $g.BtnTodos.Content = 'Marcar todos' }
+        $g.BtnTodos.Add_Click({
+                $l = $Script:ListaGui
+                $controles = @($l.Lista.Children | ForEach-Object { $_.Child })
+                $hayPendientes = (@($controles | Where-Object { -not $_.IsChecked }).Count -gt 0)
+                foreach ($c in $controles) { $c.IsChecked = $hayPendientes }
+                if ($hayPendientes) { $l.BtnTodos.Content = 'Quitar todos' } else { $l.BtnTodos.Content = 'Marcar todos' }
+            })
+    }
+    $g.BtnAceptar.Add_Click({
+            $l = $Script:ListaGui
+            $sel = New-Object System.Collections.Generic.List[string]
+            foreach ($b in @($l.Lista.Children)) {
+                $c = $b.Child
+                if ($c.IsChecked) { $sel.Add([string]$c.Tag) }
+            }
+            if ($sel.Count -eq 0) {
+                if ($l.Multi) { $l.TxtAviso.Text = 'Marque al menos una opción.' } else { $l.TxtAviso.Text = 'Elija una opción.' }
+                return
+            }
+            $l.Resultado = ($sel -join ',')
+            $l.Ventana.Close()
+        })
+    $g.BtnCancelar.Add_Click({ $Script:ListaGui.Resultado = ''; $Script:ListaGui.Ventana.Close() })
+    try { if ($Script:Gui.Ventana.IsLoaded) { $w.Owner = $Script:Gui.Ventana } } catch { }
+    [void]$w.ShowDialog()
+    return [string]$g.Resultado
+}
+
+function Get-ResumenTicket {
+    # Texto corto para pegar en un ticket o en un mensaje: equipo, salud, problemas y lo hecho en la visita.
+    $v = $Script:Sync.Visita
+    $f = $v.Ficha
+    $d = $Script:Sync.Diagnostico
+    $l = New-Object System.Collections.Generic.List[string]
+    $l.Add(('EQUIPO: {0}' -f $env:COMPUTERNAME))
+    if ($f) {
+        $modelo = ('{0} {1}' -f $f.Marca, $f.Modelo).Trim()
+        if ($modelo) { $l.Add("Modelo: $modelo") }
+        if ($f.Serie) { $l.Add("Serie: $($f.Serie)") }
+        if ($f.Procesador) { $l.Add("Procesador: $($f.Procesador)") }
+        if ($f.RAM) { $l.Add("RAM: $($f.RAM)") }
+    }
+    if ($Script:InfoSO) { $l.Add("Windows: $($Script:InfoSO)") }
+    $l.Add(('Fecha: {0}' -f (Get-Date -Format 'dd/MM/yyyy HH:mm')))
+    $l.Add('')
+    if ($d) {
+        $l.Add(('SALUD: {0}/100 - {1}' -f $d.Puntaje.Puntaje, $d.Puntaje.Estado))
+        $graves = @(@($d.Alertas) | Where-Object { $_.StartsWith('[CRÍTICO]') -or $_.StartsWith('[ALERTA]') })
+        if ($graves.Count -gt 0) {
+            $l.Add('PROBLEMAS DETECTADOS:')
+            foreach ($a in $graves) { $l.Add('- ' + ($a -replace '^\[(CRÍTICO|ALERTA)\]\s*', '$1: ')) }
+        }
+        else {
+            $l.Add('No se detectaron problemas.')
+        }
+    }
+    else {
+        $l.Add('Sin diagnóstico en esta visita.')
+    }
+    $acciones = @($v.Acciones)
+    if ($acciones.Count -gt 0) {
+        $l.Add('')
+        $l.Add('TRABAJO REALIZADO:')
+        foreach ($a in $acciones) { $l.Add("- $a") }
+    }
+    if ($null -ne $v.PuntajeAntes -and $null -ne $v.PuntajeDespues -and $v.PuntajeAntes -ne $v.PuntajeDespues) {
+        $l.Add(('Puntaje de salud: {0} -> {1}' -f $v.PuntajeAntes, $v.PuntajeDespues))
+    }
+    return ($l -join "`r`n")
+}
+
+function Copiar-ResumenGui {
+    $texto = Get-ResumenTicket
+    $ok = $false
+    try { [System.Windows.Clipboard]::SetText($texto); $ok = $true }
+    catch { try { Set-Clipboard -Value $texto; $ok = $true } catch { } }
+    if ($ok) {
+        $Script:Gui.TxtEstado.Text = '✔ Resumen copiado: péguelo en el ticket o en el mensaje al cliente.'
+        Agregar-LogGui 'Resumen para el ticket copiado al portapapeles.' 'Green'
+    }
+    else {
+        $Script:Gui.TxtEstado.Text = '⚠ No se pudo copiar al portapapeles (otra aplicación lo puede estar usando). Intente de nuevo.'
+    }
+}
+
+function Initialize-FlashNativo {
+    if ('SoporteTecnico.Nativo' -as [type]) { return $true }
+    try {
+        Add-Type -Namespace SoporteTecnico -Name Nativo -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)]
+public struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint dwFlags; public uint uCount; public uint dwTimeout; }
+[DllImport("user32.dll")]
+[return: MarshalAs(UnmanagedType.Bool)]
+public static extern bool FlashWindowEx(ref FLASHWINFO pwfi);
+'@
+        return $true
+    }
+    catch { return $false }
+}
+
+function Notificar-FinTareaGui {
+    # Al terminar una tarea larga con la ventana en segundo plano: parpadeo en la barra de tareas y sonido.
+    # Si terminó con avisos, la barra de progreso del icono queda en rojo hasta que se vuelva a la ventana.
+    param([bool]$Ok)
+    $g = $Script:Gui
+    $segundos = 0
+    if ($g.InicioTarea) { $segundos = ((Get-Date) - $g.InicioTarea).TotalSeconds }
+    $inactiva = -not $g.Ventana.IsActive
+    if ($inactiva -and -not $Ok) {
+        try {
+            $g.BarraTareas.ProgressState = [System.Windows.Shell.TaskbarItemProgressState]::Error
+            $g.BarraTareas.ProgressValue = 1.0
+        }
+        catch { }
+    }
+    if (-not $inactiva -or $segundos -lt 10) { return }
+    try {
+        if (Initialize-FlashNativo) {
+            $fw = New-Object 'SoporteTecnico.Nativo+FLASHWINFO'
+            $fw.cbSize = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf([type]'SoporteTecnico.Nativo+FLASHWINFO')
+            $fw.hwnd = (New-Object System.Windows.Interop.WindowInteropHelper($g.Ventana)).Handle
+            $fw.dwFlags = [uint32]15
+            $fw.uCount = [uint32]0
+            $fw.dwTimeout = [uint32]0
+            [void][SoporteTecnico.Nativo]::FlashWindowEx([ref]$fw)
+        }
+    }
+    catch { }
+    try { if ($Ok) { [System.Media.SystemSounds]::Asterisk.Play() } else { [System.Media.SystemSounds]::Exclamation.Play() } } catch { }
+}
+
 function Set-OcupadoGui {
     param([bool]$Ocupado, [string]$Titulo = '')
     $Script:Sync.Ocupado = $Ocupado
     $Script:Gui.Progreso.IsIndeterminate = $Ocupado
+    try {
+        if ($Ocupado) { $Script:Gui.BarraTareas.ProgressState = [System.Windows.Shell.TaskbarItemProgressState]::Indeterminate }
+        else { $Script:Gui.BarraTareas.ProgressState = [System.Windows.Shell.TaskbarItemProgressState]::None }
+    }
+    catch { }
     if ($Ocupado) { $Script:Gui.TxtEstado.Text = "Trabajando en: $Titulo... (puede tardar unos minutos, no cierre la ventana)" }
     $Script:Gui.BtnDiagnostico.IsEnabled = -not $Ocupado
     $Script:Gui.BtnCompleta.IsEnabled = -not $Ocupado
@@ -7860,6 +8124,7 @@ function Ejecutar-TareaGui {
         return
     }
     Set-OcupadoGui $true $Titulo
+    $Script:Gui.InicioTarea = Get-Date
     Agregar-LogGui '' 'Gray'
     Agregar-LogGui ("▶ {0}" -f $Titulo) 'White'
     $ps = [powershell]::Create()
@@ -7882,6 +8147,7 @@ function Finalizar-TareaGui {
     Set-OcupadoGui $false
     if ($Mensaje.Ok) { $Script:Gui.TxtEstado.Text = "✔ Listo: $($Mensaje.Texto)" }
     else { $Script:Gui.TxtEstado.Text = "⚠ Terminó con avisos o se canceló: $($Mensaje.Texto). Revise el registro de actividad." }
+    try { Notificar-FinTareaGui ([bool]$Mensaje.Ok) } catch { }
 }
 
 function Procesar-ColaGui {
@@ -8031,7 +8297,7 @@ function Iniciar-InterfazGrafica {
     $nombres = @('Principal', 'PanelLogin', 'TxtClave', 'TxtErrorClave', 'BtnEntrar', 'TxtEquipo', 'TxtVersion', 'PanelNav',
         'PaginaInicio', 'PaginaCategoria', 'TxtSubtitulo', 'ArcoPuntaje', 'TxtPuntaje', 'BordeEstado', 'TxtEstadoSalud', 'TxtResumen',
         'BtnDiagnostico', 'BtnRepararTodo', 'BtnReporte', 'BtnCompleta', 'ListaAlertas', 'ListaSugerencias', 'PanelTarjetas',
-        'TxtCategoria', 'TxtCategoriaDesc', 'PanelAcciones', 'Log', 'BtnLimpiarLog', 'Progreso', 'TxtEstado', 'GuiaInicio')
+        'TxtCategoria', 'TxtCategoriaDesc', 'PanelAcciones', 'Log', 'BtnLimpiarLog', 'Progreso', 'TxtEstado', 'GuiaInicio', 'BtnResumen', 'BarraTareas')
     foreach ($n in $nombres) { $Script:Gui[$n] = $ventana.FindName($n) }
 
     $ventana.Title = "Soporte Técnico v$($Script:Version) - $env:COMPUTERNAME"
@@ -8067,6 +8333,11 @@ function Iniciar-InterfazGrafica {
     $Script:Gui.BtnDiagnostico.Add_Click({ Ejecutar-TareaGui -Titulo 'Diagnóstico completo' -Comando 'Invoke-Diagnostico -SinPreguntas; Publicar-Diagnostico' })
     $Script:Gui.BtnRepararTodo.Add_Click({ Ejecutar-TareaGui -Titulo 'Reparar lo encontrado' -Comando 'Invoke-ReparacionAutomatica' })
     $Script:Gui.BtnCompleta.Add_Click({ Ejecutar-TareaGui -Titulo 'Reparación completa' -Comando 'Invoke-ReparacionCompleta' })
+    $Script:Gui.BtnResumen.Add_Click({ Copiar-ResumenGui })
+    # Al volver a la ventana se quita el rojo de la barra de tareas (si no hay una tarea en curso)
+    $ventana.Add_Activated({
+            try { if (-not $Script:Sync.Ocupado) { $Script:Gui.BarraTareas.ProgressState = [System.Windows.Shell.TaskbarItemProgressState]::None } } catch { }
+        })
     $Script:Gui.BtnReporte.Add_Click({
             if ($Script:Sync.Diagnostico -and $Script:Sync.Diagnostico.Html) { Abrir-ParaUsuario $Script:Sync.Diagnostico.Html }
         })
