@@ -1,6 +1,6 @@
 # Soporte Técnico para Windows 10/11 (v2.8)
 
-> **Estado: en desarrollo.** Hasta la versión 2.7 se probó en Windows. Las funciones nuevas de la 2.8 (Formatear equipo y Reportes) todavía no. Úselas primero en un equipo de prueba.
+> **Estado: en desarrollo.** Se probó en Windows hasta la versión 2.6 (con impresoras, Windows Update, perfil e inicio). Los cambios de la 2.7 (clave de los `.stv`) y de la 2.8 (Formatear equipo y Reportes) todavía no se han probado. Úselos primero en un equipo de prueba.
 
 Herramienta portable para técnicos de soporte. Diagnostica el equipo, le pone un puntaje de salud, sugiere qué reparar y aplica las reparaciones. Todo lo que hace queda registrado en un log.
 
@@ -88,9 +88,9 @@ En la versión de consola, estas reparaciones nuevas (incluidas las de drivers) 
 
 ### Respaldar y restaurar datos del cliente
 
-- **Qué copia:** Escritorio, Documentos, Imágenes, Descargas, Música y Videos del **usuario con sesión**, con su ubicación real aunque estén redirigidos. También los correos de Outlook (`.pst`) que estén fuera de Documentos, los favoritos de Chrome, Edge, Brave y Firefox, y las redes WiFi guardadas.
-- **OneDrive:** las carpetas que están en OneDrive aparecen sin marcar, porque ya están en la nube. Copiarlas haría bajar todos los archivos que solo están en línea.
-- **Redes WiFi:** se guardan con sus claves, pero **solo cifradas** en `Redes_WiFi.stv`, que únicamente abre esta herramienta con su contraseña. Los archivos con las claves en texto existen solo unos segundos en una carpeta temporal que se borra siempre.
+- **Qué copia:** Escritorio, Documentos, Imágenes, Descargas, Música y Videos del **usuario con sesión**, con su ubicación real aunque estén redirigidos. También los correos de Outlook (`.pst`), estén donde estén, los favoritos de Chrome, Edge, Brave y Firefox, y las redes WiFi guardadas.
+- **OneDrive:** las carpetas que están en OneDrive aparecen sin marcar, porque ya están en la nube. Copiarlas haría bajar todos los archivos que solo están en línea. Los `.pst` se respaldan aparte aunque estén en una carpeta de OneDrive, porque OneDrive no los sincroniza bien.
+- **Redes WiFi:** se guardan con sus claves, pero **solo cifradas** en `Redes_WiFi.stv`, que únicamente abre esta herramienta con su contraseña. Los archivos con las claves en texto existen solo unos segundos en una carpeta temporal que se borra siempre. **Si la herramienta no tiene contraseña**, el archivo usa una clave fija y alguien que extraiga el script del `.exe` podría leer las claves. En ese caso la opción aparece sin marcar y con un aviso.
 - **Antes de copiar** revisa que haya espacio suficiente y si el destino es FAT32, que no admite archivos de más de 4 GB. **No deja respaldar en el disco del sistema**, porque se perdería al formatear. Si hay `.pst`, cierra Outlook.
 - **El respaldo** queda en `Datos_<equipo>_<fecha>\`, con `manifiesto.txt`, `LEEME.txt` y `robocopy.log`. En la USB se guarda en `Clientes\<equipo>\`.
 - **Al restaurar** se listan los respaldos de todos los equipos de la USB y se marca el de este equipo por número de serie, porque después de formatear el nombre cambia.

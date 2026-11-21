@@ -5501,6 +5501,8 @@ function Registrar-AccionVisita {
     param([string]$Titulo, [ValidateSet('OK', 'Avisos', 'Error', 'Interrumpida')][string]$Estado)
     $v = $Sync.Visita
     if (-not $v.Activa) { return }
+    # "2. Respaldar todos los drivers" (Formatear equipo) es el mismo trabajo que "Respaldar todos los drivers"
+    $Titulo = ($Titulo -replace '^\d+\.\s+', '')
     # 'Reparar lo encontrado' se anota paso por paso dentro de Invoke-ReparacionAutomatica
     # Lo que solo consulta o genera reportes no es un trabajo hecho al equipo
     if (@('Datos del equipo', 'Reporte de entrega para el cliente', 'Reporte de atenciones', 'Abrir el historial en Excel', 'Exportar esta visita', 'Importar visitas remotas') -contains $Titulo) { return }
@@ -5707,8 +5709,8 @@ function Guardar-Visita {
         $antes = ''; if ($null -ne $v.PuntajeAntes) { $antes = "$($v.PuntajeAntes)" }
         $despues = ''; if ($null -ne $v.PuntajeDespues) { $despues = "$($v.PuntajeDespues)" }
         $fila = [pscustomobject][ordered]@{
-            Fecha          = $v.Inicio.ToString('dd/MM/yyyy HH:mm')
-            Hasta          = (Get-Date -Format 'HH:mm')
+            Fecha          = $v.Inicio.ToString('dd/MM/yyyy HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
+            Hasta          = (Get-Date).ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
             Equipo         = $env:COMPUTERNAME
             Cliente        = "$($v.Cliente)"
             Usuario        = (& $dato 'Usuario')
@@ -5988,7 +5990,7 @@ function Importar-ArchivoVisita {
         }
         $columnas = New-Object System.Collections.Generic.List[string]
         foreach ($x in $filas) { foreach ($c in $x.PSObject.Properties.Name) { if (-not $columnas.Contains($c)) { $columnas.Add($c) } } }
-        $ordenadas = @($filas | Sort-Object -Property @{ e = { $d = [datetime]::MinValue; [void][datetime]::TryParseExact("$($_.Fecha)", 'dd/MM/yyyy HH:mm', $null, 'None', [ref]$d); $d } })
+        $ordenadas = @($filas | Sort-Object -Property @{ e = { $d = [datetime]::MinValue; [void][datetime]::TryParseExact("$($_.Fecha)", 'dd/MM/yyyy HH:mm', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d); $d } })
         $tmp = "$ruta.tmp"
         $ordenadas | Select-Object -Property @($columnas) | Export-Csv -LiteralPath $tmp -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
         Move-Item -LiteralPath $tmp -Destination $ruta -Force -ErrorAction Stop
@@ -6415,7 +6417,9 @@ function New-ReporteEntrega {
     $antesLista = @($v.AlertasAntes | Where-Object { "$_" -notlike '`[INFO`]*' } | ForEach-Object { & $limpiar $_ })
     $despuesLista = @($v.AlertasDespues | Where-Object { "$_" -notlike '`[INFO`]*' } | ForEach-Object { & $limpiar $_ })
     if ($diagnosticos -ge 2) {
-        $resueltos = @($antesLista | Where-Object { $despuesLista -notcontains $_ })
+        $normalizar = { param($t) ("$t" -replace '\d+([.,]\d+)?', '#').Trim() }
+        $despuesNorm = @($despuesLista | ForEach-Object { & $normalizar $_ })
+        $resueltos = @($antesLista | Where-Object { $despuesNorm -notcontains (& $normalizar $_) })
         if ($resueltos.Count -gt 0) {
             [void]$sb.Append('<h2>Problemas resueltos</h2><ul>')
             foreach ($r in $resueltos) { [void]$sb.Append(('<li class="ok">✔ {0}</li>' -f (Html $r))) }
@@ -6756,12 +6760,13 @@ function Respaldar-DatosCliente {
         if ($c.EnOneDrive) { $texto += ' (está en OneDrive: ya está en la nube)' }
         $opciones.Add([pscustomobject]@{ Tipo = 'Carpeta'; Texto = $texto; Dato = $c; Bytes = $res.Bytes; Grandes = $res.Grandes; Predeterminada = (-not $c.EnOneDrive) })
     }
-    $psts = @(Get-ArchivosPst $perfil $documentos | Where-Object { -not $documentos -or -not $_.StartsWith($documentos + '\', [System.StringComparison]::OrdinalIgnoreCase) })
-    $pstsDentro = @(Get-ArchivosPst $perfil $documentos | Where-Object { $documentos -and $_.StartsWith($documentos + '\', [System.StringComparison]::OrdinalIgnoreCase) })
+    # Todos los .pst, también los de Documentos: si Documentos está en OneDrive (sin marcar), los .pst
+    # quedarían fuera, y OneDrive no sincroniza bien los .pst.
+    $psts = @(Get-ArchivosPst $perfil $documentos)
     if ($psts.Count -gt 0) {
         $bytes = [long]0; $grandes = @()
         foreach ($p in $psts) { $len = (Get-Item -LiteralPath $p).Length; $bytes += $len; if ($len -ge 4GB) { $grandes += $p } }
-        $opciones.Add([pscustomobject]@{ Tipo = 'Pst'; Texto = ('Correos de Outlook guardados fuera de Documentos ({0} archivo(s) .pst, {1})' -f $psts.Count, (Format-Tamano $bytes)); Dato = $psts; Bytes = $bytes; Grandes = $grandes; Predeterminada = $true })
+        $opciones.Add([pscustomobject]@{ Tipo = 'Pst'; Texto = ('Correos de Outlook ({0} archivo(s) .pst, {1})' -f $psts.Count, (Format-Tamano $bytes)); Dato = $psts; Bytes = $bytes; Grandes = $grandes; Predeterminada = $true })
     }
     $navegadores = @(Get-PerfilesNavegador $perfil)
     if ($navegadores.Count -gt 0) {
@@ -6770,15 +6775,28 @@ function Respaldar-DatosCliente {
     $hayWifi = $false
     try { $hayWifi = [bool](Get-Service -Name 'WlanSvc' -ErrorAction Stop) } catch { }
     if ($hayWifi) {
-        $opciones.Add([pscustomobject]@{ Tipo = 'Wifi'; Texto = 'Redes WiFi guardadas (con sus claves, en un archivo cifrado que solo abre esta herramienta)'; Dato = $null; Bytes = [long]0; Grandes = @(); Predeterminada = $true })
+        $textoWifi = 'Redes WiFi guardadas (con sus claves, en un archivo cifrado que solo abre esta herramienta con su contraseña)'
+        if (-not $Sync.ClaveExportacion) { $textoWifi = 'Redes WiFi guardadas (ATENCIÓN: la herramienta no tiene contraseña, así que el archivo usa una clave fija y alguien que extraiga el script podría leer las claves)' }
+        $opciones.Add([pscustomobject]@{ Tipo = 'Wifi'; Texto = $textoWifi; Dato = $null; Bytes = [long]0; Grandes = @(); Predeterminada = [bool]$Sync.ClaveExportacion })
     }
     if ($opciones.Count -eq 0) { Write-Log 'No se encontraron datos que respaldar.' 'ADVERTENCIA'; return $false }
     $predet = @(for ($i = 0; $i -lt $opciones.Count; $i++) { if ($opciones[$i].Predeterminada) { $i } })
     $indices = Elegir-Varias -Pregunta '¿Qué respaldar?' -Opciones @($opciones | ForEach-Object { $_.Texto }) -Predeterminadas $predet
     if ($null -eq $indices -or @($indices).Count -eq 0) { Write-Log 'Operación cancelada.' 'INFO'; return $false }
     $elegidas = @($indices | ForEach-Object { $opciones[$_] })
-    if ($pstsDentro.Count -gt 0 -and @($elegidas | Where-Object { $_.Tipo -eq 'Carpeta' -and $_.Dato.Clave -eq 'Personal' }).Count -gt 0) {
-        Write-Host ("    Hay {0} archivo(s) .pst dentro de Documentos: se copian con esa carpeta." -f $pstsDentro.Count) -ForegroundColor DarkGray
+    $rutasElegidas = @($elegidas | Where-Object { $_.Tipo -eq 'Carpeta' } | ForEach-Object { $_.Dato.Ruta })
+    $dentroDeElegida = { param($archivo) @($rutasElegidas | Where-Object { $archivo.StartsWith($_ + '\', [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0 }
+    $pstsDentro = @($psts | Where-Object { & $dentroDeElegida $_ })
+    $opcionPst = @($elegidas | Where-Object { $_.Tipo -eq 'Pst' }) | Select-Object -First 1
+    if ($opcionPst) {
+        # Los que ya van dentro de una carpeta elegida no se copian dos veces
+        $opcionPst.Dato = @($psts | Where-Object { -not (& $dentroDeElegida $_) })
+        $opcionPst.Bytes = [long]0
+        foreach ($p in $opcionPst.Dato) { $opcionPst.Bytes += (Get-Item -LiteralPath $p).Length }
+        if ($pstsDentro.Count -gt 0) { Write-Host ("    {0} archivo(s) .pst ya van dentro de las carpetas elegidas." -f $pstsDentro.Count) -ForegroundColor DarkGray }
+    }
+    elseif ($psts.Count -gt $pstsDentro.Count) {
+        Write-Log ("No eligió los correos de Outlook: {0} archivo(s) .pst NO se van a respaldar." -f ($psts.Count - $pstsDentro.Count)) 'ADVERTENCIA'
     }
 
     # Destino
@@ -6830,7 +6848,7 @@ function Respaldar-DatosCliente {
 
     Write-Host ("    Se van a copiar {0} a {1}" -f (Format-Tamano $total), $destino) -ForegroundColor Cyan
     if (-not (Confirmar '¿Empezar el respaldo?')) { return $false }
-    if ((@($elegidas | Where-Object { $_.Tipo -eq 'Pst' }).Count -gt 0) -or ($pstsDentro.Count -gt 0)) {
+    if (($opcionPst -and @($opcionPst.Dato).Count -gt 0) -or ($pstsDentro.Count -gt 0)) {
         if (-not (Cerrar-Outlook)) { Write-Log 'Outlook sigue abierto: los .pst pueden no copiarse.' 'ADVERTENCIA' }
     }
     try { New-Item -ItemType Directory -Path $destino -Force -ErrorAction Stop | Out-Null }
@@ -7036,7 +7054,7 @@ function Restaurar-DatosCliente {
     if ($plan.Count -eq 0 -and -not $hayPst -and -not $hayFav -and -not $hayWifi) { Write-Log 'El respaldo está vacío.' 'ADVERTENCIA'; return $false }
     if (-not (Confirmar '¿Restaurar estos datos?')) { return $false }
 
-    $log = Join-Path $env:TEMP ('soporte_restaurar_{0}.log' -f (Get-Date -Format 'yyyyMMddHHmmss'))
+    $log = Join-Path $Script:DirReportes ('restaurar_datos_{0}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
     $fallos = 0
     foreach ($p in $plan) {
         if (-not (Copiar-ConRobocopy -Origen $p.Origen -Destino $p.Destino -Log $log -NoSobrescribirNuevos -Descripcion ("Restaurar {0}" -f $p.Nombre))) { $fallos++ }
@@ -7051,8 +7069,8 @@ function Restaurar-DatosCliente {
     }
     if ($hayFav) { if (-not (Restaurar-Favoritos -Respaldo (Join-Path $m.Carpeta 'Favoritos') -Perfil $perfil)) { $fallos++ } }
     if ($hayWifi) { if (-not (Restaurar-RedesWifi -Archivo (Join-Path $m.Carpeta $m.Wifi))) { $fallos++ } }
+    if ($fallos -gt 0) { Write-Log ("Restauración terminada con {0} parte(s) con errores. Detalle en {1}" -f $fallos, $log) 'ADVERTENCIA'; return $false }
     Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
-    if ($fallos -gt 0) { Write-Log ("Restauración terminada con {0} parte(s) con errores." -f $fallos) 'ADVERTENCIA'; return $false }
     Write-Log 'Datos del cliente restaurados.' 'OK'
     return $true
 }
