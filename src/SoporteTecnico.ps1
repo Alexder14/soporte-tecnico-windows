@@ -16,7 +16,7 @@ $Script:FuncionesIniciales = @(Get-ChildItem -Path function: | ForEach-Object { 
 $Script:ModoInterfaz = 'Grafica'
 if ($Consola) { $Script:ModoInterfaz = 'Consola' }
 
-$Script:Version = '2.6'
+$Script:Version = '2.7'
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -5757,9 +5757,12 @@ function Set-ClaveExportacion {
     # Al entrar con la contraseña: deriva la clave que cifra los archivos .stv de visitas.
     # Se guarda solo la clave derivada (nunca la contraseña) y no está dentro del .exe:
     # sin la contraseña de la herramienta, un .stv no se puede abrir.
+    # La sal y las iteraciones son fijas a propósito: Compilar.ps1 genera una sal de acceso nueva en cada
+    # compilación, y si la clave dependiera de ella, los .stv dejarían de abrirse al recompilar.
+    # Así la clave depende solo de la contraseña: mismo .env = mismos .stv, en cualquier compilación.
     param([string]$Clave)
-    $sal = [System.Text.Encoding]::UTF8.GetBytes('SoporteTecnico.Visitas.v1|') + [Convert]::FromBase64String($Script:ClaveSal)
-    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($Clave, [byte[]]$sal, [int]$Script:ClaveIteraciones)
+    $sal = [System.Text.Encoding]::UTF8.GetBytes('SoporteTecnico.Visitas.v2|clave-de-exportacion')
+    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($Clave, [byte[]]$sal, 200000)
     try { $Sync.ClaveExportacion = [byte[]]$kdf.GetBytes(32) }
     finally { $kdf.Dispose() }
 }
