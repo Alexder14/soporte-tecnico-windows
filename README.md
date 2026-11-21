@@ -248,6 +248,31 @@ Los scripts temporales que se ejecutan en la sesión del usuario siempre van a `
 
 > Los reportes incluyen modelo, número de serie y nombre de cada equipo. Si pierde la USB, esos datos quedan expuestos: considere cifrarla con BitLocker To Go.
 
+## Pruebas automáticas
+
+Antes de compilar o de hacer un commit, ejecute:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File build\Probar.ps1
+```
+
+Dura unos 40 segundos. **No necesita administrador y no cambia nada del equipo**: las funciones de reparación se prueban cancelando en la confirmación, y al final se comprueba que el registro, los servicios, las impresoras y las carpetas de Windows Update quedaron exactamente igual. Si se ejecuta como administrador, esas pruebas se omiten por seguridad. Termina con código 0 si todo pasó y con 1 si algo falló. Los avisos no hacen fallar.
+
+Qué comprueba:
+
+| Grupo | Qué revisa |
+|---|---|
+| Archivos y seguridad | Sintaxis de todos los `.ps1`, UTF-8 con BOM y CRLF, `.bat` en ASCII, marcadores de conflicto de git, funciones duplicadas, que el script no lleve el hash de la contraseña y que git no siga `.env` ni `.exe` |
+| Código | Que toda llamada a una función exista (un error de tecleo en una función rara no aparecería hasta usarla) y que cada acción del catálogo apunte a una función real |
+| Lógica | Los selectores de listas (consola y ventana), el resumen del ticket, la contraseña del `.env` (lectura, hash, inyección y validación con la función real) y la lectura de programas instalados |
+| Funciones que solo leen | Las reparaciones de impresora, perfil y Windows Update cancelan sin cambiar nada |
+| Ventanas | Que cada XAML cargue, que el código encuentre todos los controles que busca, y el comportamiento de la ventana de lista y de los cuadros de diálogo (se abren, se pulsan sus botones y se cierran solos) |
+| Compilación | Compila una copia aislada con un `ps2exe` falso: con `.env`, sin `.env` y con una clave demasiado corta; comprueba que el `.exe` valide la contraseña, que el script fuente no se modifique y que no queden temporales |
+
+Opciones: `-Rapido` (solo archivos y lógica, unos 20 segundos), `-SinVentanas` (omite las pruebas que abren ventanas) y `-Fuente <ruta>` (prueba otro script).
+
+No sustituyen una prueba real con administrador de las reparaciones, que cambian el sistema.
+
 ## Compilar
 
 En un equipo Windows, con internet solo la primera vez (para descargar `ps2exe`):
