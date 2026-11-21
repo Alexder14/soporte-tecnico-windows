@@ -36,8 +36,25 @@ if ($errores -and $errores.Count -gt 0) {
 }
 Write-Host 'Sintaxis OK.' -ForegroundColor Green
 
-if ([System.IO.File]::ReadAllText($fuente) -match "(?m)^\`$Script:ClaveHash\s*=\s*''") {
-    Write-Host 'Aviso: no hay contraseña configurada. Para ponerla: build\CambiarContrasena.ps1' -ForegroundColor Yellow
+# ---------- Contraseña: se toma del archivo .env (SOPORTE_CLAVE=...) ----------
+. (Join-Path $PSScriptRoot 'Clave.ps1')
+$claveEnv = $null
+$archivoEnv = Join-Path $raiz '.env'
+$valoresEnv = Read-DotEnv $archivoEnv
+if ($valoresEnv.ContainsKey('SOPORTE_CLAVE') -and $valoresEnv['SOPORTE_CLAVE']) {
+    $claveEnv = $valoresEnv['SOPORTE_CLAVE']
+    if ($claveEnv.Length -lt 6) {
+        Write-Host 'La contraseña de .env (SOPORTE_CLAVE) debe tener al menos 6 caracteres.' -ForegroundColor Red
+        exit 1
+    }
+    Write-Host ("Contraseña tomada de .env ({0} caracteres). En los .exe solo entra su hash." -f $claveEnv.Length) -ForegroundColor Green
+}
+elseif (Test-Path -LiteralPath $archivoEnv) {
+    Write-Host 'El archivo .env existe pero SOPORTE_CLAVE está vacía.' -ForegroundColor Yellow
+}
+$valoresEnv = $null
+if (-not $claveEnv -and [System.IO.File]::ReadAllText($fuente) -match "(?m)^\`$Script:ClaveHash\s*=\s*''") {
+    Write-Host 'Aviso: no hay contraseña configurada. Cree un archivo .env con SOPORTE_CLAVE=... (vea .env.example).' -ForegroundColor Yellow
 }
 
 # ---------- 2. Verificar codificación (UTF-8 con BOM) ----------
@@ -70,12 +87,27 @@ if ($contenido -match "\`$Script:Version\s*=\s*'(\d+)\.(\d+)'") {
 # SoporteTecnico-Consola.exe  -> menú de texto (para sesiones remotas lentas o si la interfaz falla)
 $salidaConsola = Join-Path $raiz 'SoporteTecnico-Consola.exe'
 $fuenteConsola = Join-Path $env:TEMP 'SoporteTecnico_consola.ps1'
+$fuenteGrafica = $fuente
 $marca = "`$Script:ModoInterfaz = 'Grafica'"
 if (-not $contenido.Contains($marca)) {
     Write-Host "No se encontró la línea $marca en el script." -ForegroundColor Red
     exit 1
 }
-[System.IO.File]::WriteAllText($fuenteConsola, $contenido.Replace($marca, "`$Script:ModoInterfaz = 'Consola'"), (New-Object System.Text.UTF8Encoding($true)))
+$utf8Bom = New-Object System.Text.UTF8Encoding($true)
+if ($claveEnv) {
+    # La contraseña va solo en copias temporales: src\SoporteTecnico.ps1 no se modifica.
+    try {
+        $contenido = Set-ClaveEnTexto -Texto $contenido -Datos (New-DatosClave -Clave $claveEnv)
+    }
+    catch {
+        Write-Host ("No se pudo aplicar la contraseña: {0}" -f $_.Exception.Message) -ForegroundColor Red
+        exit 1
+    }
+    $claveEnv = $null
+    $fuenteGrafica = Join-Path $env:TEMP 'SoporteTecnico_grafica.ps1'
+    [System.IO.File]::WriteAllText($fuenteGrafica, $contenido, $utf8Bom)
+}
+[System.IO.File]::WriteAllText($fuenteConsola, $contenido.Replace($marca, "`$Script:ModoInterfaz = 'Consola'"), $utf8Bom)
 
 $comunes = @{
     requireAdmin = $true
@@ -94,7 +126,7 @@ else {
 }
 
 $grafica = $comunes.Clone()
-$grafica['inputFile'] = $fuente
+$grafica['inputFile'] = $fuenteGrafica
 $grafica['outputFile'] = $salida
 $grafica['noConsole'] = $true
 $grafica['noOutput'] = $true
@@ -111,6 +143,7 @@ foreach ($exe in @($salida, $salidaConsola)) {
         catch {
             Write-Host "No se pudo borrar $exe (¿está abierto?). Ciérrelo y vuelva a compilar." -ForegroundColor Red
             Remove-Item -LiteralPath $fuenteConsola -Force -ErrorAction SilentlyContinue
+            if ($fuenteGrafica -ne $fuente) { Remove-Item -LiteralPath $fuenteGrafica -Force -ErrorAction SilentlyContinue }
             exit 1
         }
     }
@@ -124,6 +157,7 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $fuenteConsola -Force -ErrorAction SilentlyContinue
+    if ($fuenteGrafica -ne $fuente) { Remove-Item -LiteralPath $fuenteGrafica -Force -ErrorAction SilentlyContinue }
 }
 
 $faltan = @(@($salida, $salidaConsola) | Where-Object { -not (Test-Path -LiteralPath $_) })

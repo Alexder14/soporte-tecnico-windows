@@ -3303,7 +3303,7 @@ function Get-EstadoPerfil {
     $r = Nuevo-Estado
     $perfil = Get-PerfilUsuarioActivo
     $r.Lineas.Add(("Perfil: {0} en {1}" -f $perfil.Usuario, $perfil.Ruta))
-    $consejo = 'Perfil dañado: NO borrar nada. Corregir la clave ProfileList del registro (la que termina en .bak) con respaldo previo, o crear un usuario nuevo y copiar los datos.'
+    $consejo = 'Perfil dañado: NO borrar nada. Use Sistema > "Reparar perfil de usuario" (respalda el registro y restaura la clave .bak) o cree un usuario nuevo y copie los datos.'
     if ("$($perfil.Ruta)" -match '\\TEMP(\.|$)') {
         $r.Problemas.Add((Nuevo-Problema -Texto 'El usuario está usando un PERFIL TEMPORAL (no ve su escritorio ni sus archivos).' -Sugerencia $consejo -Critica))
     }
@@ -4659,6 +4659,20 @@ function Elegir-Dispositivo {
     param([string]$Pregunta)
     $lista = @(Get-ListaDispositivosElegibles)
     if ($lista.Count -eq 0) { Write-Log 'No hay dispositivos para elegir.' 'INFO'; return $null }
+    if ($Script:ModoInterfaz -eq 'Grafica') {
+        # En la ventana la lista va dentro del cuadro de diálogo, no solo en el registro de actividad.
+        $opciones = @(foreach ($d in $lista) {
+                $nombre = "$($d.FriendlyName)"
+                if (-not $nombre) { $nombre = 'Dispositivo desconocido' }
+                $estado = ''
+                if ([int]$d.ConfigManagerErrorCode -ne 0) { $estado = '   <- ' + (Get-DescripcionCodigoPnp $d.ConfigManagerErrorCode) }
+                '[{0}] {1}{2}' -f $d.Class, $nombre, $estado
+            })
+        $idx = Elegir-Opcion $Pregunta $opciones
+        if ($idx -ge 0) { return $lista[$idx] }
+        Write-Log 'Operación cancelada.' 'INFO'
+        return $null
+    }
     for ($i = 0; $i -lt $lista.Count; $i++) {
         $d = $lista[$i]
         $nombre = "$($d.FriendlyName)"
@@ -4857,12 +4871,459 @@ function Abrir-PaginaFabricante {
 
 #endregion
 
+#region ==================== PAQUETE C: IMPRESORA, WINDOWS UPDATE Y PERFIL ====================
+
+function Elegir-Opcion {
+    # Elige un elemento de una lista numerada. En la ventana la lista va DENTRO del cuadro de diálogo
+    # (no solo en el registro de actividad). Devuelve el índice (desde 0) o -1 si se cancela o no es válido.
+    param([string]$Pregunta, [string[]]$Opciones)
+    $Opciones = @($Opciones)
+    if ($Opciones.Count -eq 0) { return -1 }
+    $lineas = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $Opciones.Count; $i++) { $lineas.Add(('{0}. {1}' -f ($i + 1), $Opciones[$i])) }
+    if ($Script:ModoInterfaz -eq 'Grafica') {
+        $resp = Solicitar-Gui -Tipo 'Texto' -Texto (($lineas -join "`n") + "`n`n" + $Pregunta)
+    }
+    else {
+        foreach ($l in $lineas) { Write-Host ("    {0}" -f $l) }
+        Write-Host ''
+        $resp = Read-Host $Pregunta
+    }
+    $n = 0
+    if ([int]::TryParse("$resp".Trim(), [ref]$n) -and $n -ge 1 -and $n -le $Opciones.Count) { return ($n - 1) }
+    return -1
+}
+
+function Set-ValorDword {
+    param([string]$Ruta, [string]$Nombre, [int]$Valor)
+    if (-not (Test-Path -Path $Ruta)) { New-Item -Path $Ruta -Force | Out-Null }
+    New-ItemProperty -Path $Ruta -Name $Nombre -Value $Valor -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+}
+
+function Reiniciar-Spooler {
+    $null = Detener-Servicio 'Spooler'
+    return (Iniciar-Servicio 'Spooler')
+}
+
+# ---------- Impresoras ----------
+
+function Reparar-ImpresoraRpc {
+    Mostrar-Titulo 'IMPRESORA: ERROR 0x0000011b / 0x00000709 AL CONECTAR'
+    Write-Host '    Aparece al conectarse a una impresora COMPARTIDA en red tras una actualización de seguridad de Windows.' -ForegroundColor Cyan
+    Write-Host '    Windows exige una autenticación RPC más estricta; la corrección la relaja (RpcAuthnLevelPrivacyEnabled = 0).' -ForegroundColor DarkGray
+    Write-Host '    Conviene aplicarla en el equipo que COMPARTE la impresora y también en el que se conecta.' -ForegroundColor DarkGray
+    Write-Host '    Baja un poco la seguridad de la impresión en red: úsela solo en redes de confianza.' -ForegroundColor Yellow
+    $clave = 'HKLM:\SYSTEM\CurrentControlSet\Control\Print'
+    $actual = $null
+    try { $actual = (Get-ItemProperty -Path $clave -Name 'RpcAuthnLevelPrivacyEnabled' -ErrorAction Stop).RpcAuthnLevelPrivacyEnabled } catch { }
+    if ($null -ne $actual -and [int]$actual -eq 0) {
+        Write-Log 'La corrección ya está aplicada en este equipo (RpcAuthnLevelPrivacyEnabled = 0).' 'INFO'
+        if (-not (Confirmar '¿Quitarla y volver al valor seguro de Windows?')) { return $true }
+        try { Remove-ItemProperty -Path $clave -Name 'RpcAuthnLevelPrivacyEnabled' -ErrorAction Stop; Write-Log 'Corrección quitada.' 'OK' }
+        catch { Write-Log "No se pudo quitar la corrección: $($_.Exception.Message)" 'ERROR'; return $false }
+        return (Reiniciar-Spooler)
+    }
+    if (-not (Confirmar '¿Aplicar la corrección (error 0x0000011b / 0x00000709) y reiniciar el servicio de impresión?')) {
+        Write-Log 'Cancelado por el usuario.' 'INFO'
+        return $false
+    }
+    try { Set-ValorDword $clave 'RpcAuthnLevelPrivacyEnabled' 0 }
+    catch { Write-Log "No se pudo aplicar la corrección: $($_.Exception.Message)" 'ERROR'; return $false }
+    $ok = Reiniciar-Spooler
+    Write-Log 'Corrección aplicada. Vuelva a conectar la impresora compartida; si sigue igual, reinicie el equipo y aplique lo mismo en el que la comparte.' 'OK'
+    return $ok
+}
+
+function Reparar-ImpresoraPredeterminada {
+    Mostrar-Titulo 'IMPRESORA: ERROR 0x00000709 AL FIJAR LA PREDETERMINADA'
+    Write-Host '    Windows administra solo la impresora predeterminada (la última que se usó) y choca con la elección manual.' -ForegroundColor Cyan
+    Write-Host '    La corrección desactiva esa administración automática para el usuario de la sesión (LegacyDefaultPrinterMode = 1).' -ForegroundColor DarkGray
+    $perfil = Get-PerfilUsuarioActivo
+    $clave = "$($perfil.Registro)\Software\Microsoft\Windows NT\CurrentVersion\Windows"
+    $actual = $null
+    try { $actual = (Get-ItemProperty -Path $clave -Name 'LegacyDefaultPrinterMode' -ErrorAction Stop).LegacyDefaultPrinterMode } catch { }
+    if ($null -ne $actual -and [int]$actual -eq 1) {
+        Write-Log ("La corrección ya está aplicada para {0}." -f $perfil.Usuario) 'INFO'
+        if (-not (Confirmar '¿Quitarla y dejar que Windows vuelva a administrar la impresora predeterminada?')) { return $true }
+        try { Remove-ItemProperty -Path $clave -Name 'LegacyDefaultPrinterMode' -ErrorAction Stop; Write-Log 'Corrección quitada.' 'OK'; return $true }
+        catch { Write-Log "No se pudo quitar la corrección: $($_.Exception.Message)" 'ERROR'; return $false }
+    }
+    if (-not (Confirmar ("¿Aplicar la corrección para el usuario {0}?" -f $perfil.Usuario))) {
+        Write-Log 'Cancelado por el usuario.' 'INFO'
+        return $false
+    }
+    try { Set-ValorDword $clave 'LegacyDefaultPrinterMode' 1 }
+    catch { Write-Log "No se pudo aplicar la corrección: $($_.Exception.Message)" 'ERROR'; return $false }
+    Write-Log ("Listo para {0}. Ya puede elegir la impresora predeterminada a mano en Configuración > Impresoras." -f $perfil.Usuario) 'OK'
+    return $true
+}
+
+function Reparar-ImpresoraDriverBloqueado {
+    Mostrar-Titulo 'IMPRESORA: ERROR 0x00000bcb / 0x0000007c (DRIVER BLOQUEADO)'
+    Write-Host '    Desde las actualizaciones de 2021 (PrintNightmare) solo un administrador puede instalar drivers de impresoras compartidas.' -ForegroundColor Cyan
+    Write-Host '    Un usuario normal ve el error 0x00000bcb o 0x0000007c al conectar la impresora.' -ForegroundColor DarkGray
+    Write-Host '    Lo MÁS SEGURO es instalar usted el driver como administrador y no cambiar nada.' -ForegroundColor Yellow
+    Write-Host '    Esta opción permite instalarlo a usuarios normales y deja el equipo MENOS protegido.' -ForegroundColor Yellow
+    $clave = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint'
+    $actual = $null
+    try { $actual = (Get-ItemProperty -Path $clave -Name 'RestrictDriverInstallationToAdministrators' -ErrorAction Stop).RestrictDriverInstallationToAdministrators } catch { }
+    if ($null -ne $actual -and [int]$actual -eq 0) {
+        Write-Log 'Ya se permite a usuarios normales instalar drivers de impresora.' 'INFO'
+        if (-not (Confirmar '¿Volver a restringirlo solo a administradores (recomendado)?')) { return $true }
+        try { Set-ValorDword $clave 'RestrictDriverInstallationToAdministrators' 1; Write-Log 'Restringido de nuevo a administradores.' 'OK' }
+        catch { Write-Log "No se pudo cambiar: $($_.Exception.Message)" 'ERROR'; return $false }
+        return (Reiniciar-Spooler)
+    }
+    if (-not (Confirmar '¿Permitir que usuarios normales instalen drivers de impresora? (menos seguro)')) {
+        Write-Log 'Cancelado por el usuario.' 'INFO'
+        return $false
+    }
+    try { Set-ValorDword $clave 'RestrictDriverInstallationToAdministrators' 0 }
+    catch { Write-Log "No se pudo aplicar el cambio: $($_.Exception.Message)" 'ERROR'; return $false }
+    $ok = Reiniciar-Spooler
+    Write-Log 'Hecho. El usuario ya puede conectar la impresora. Cuando termine, vuelva a ejecutar esta opción para restringirlo de nuevo.' 'OK'
+    return $ok
+}
+
+function Reinstalar-Impresora {
+    Mostrar-Titulo 'REINSTALAR UNA IMPRESORA (PUERTO Y DRIVER)'
+    $todas = @()
+    try { $todas = @(Get-Printer -ErrorAction Stop) }
+    catch { Write-Log "No se pudo listar las impresoras: $($_.Exception.Message)" 'ERROR'; return $false }
+    $virtuales = @('PORTPROMPT:', 'nul:', 'SHRFAX:', 'FILE:')
+    $impresoras = @($todas | Where-Object { $virtuales -notcontains "$($_.PortName)" -and "$($_.DriverName)" -notmatch 'Microsoft (Print To PDF|XPS Document Writer)|OneNote' })
+    if ($impresoras.Count -eq 0) { Write-Log 'No hay impresoras físicas ni de red instaladas.' 'INFO'; return $true }
+
+    $opciones = @($impresoras | ForEach-Object { '{0}   (puerto {1}, driver {2})' -f $_.Name, $_.PortName, $_.DriverName })
+    $idx = Elegir-Opcion 'Número de la impresora a reinstalar (Cancelar = salir)' $opciones
+    if ($idx -lt 0) { Write-Log 'Operación cancelada.' 'INFO'; return $false }
+    $p = $impresoras[$idx]
+    $nombre = "$($p.Name)"
+    $driver = "$($p.DriverName)"
+    $puerto = "$($p.PortName)"
+    $esConexion = ("$($p.Type)" -eq 'Connection')
+
+    $infoPuerto = $null
+    if (-not $esConexion) { try { $infoPuerto = Get-PrinterPort -Name $puerto -ErrorAction Stop } catch { } }
+    $otrasPuerto = @($todas | Where-Object { "$($_.Name)" -ne $nombre -and "$($_.PortName)" -eq $puerto }).Count
+    $otrasDriver = @($todas | Where-Object { "$($_.Name)" -ne $nombre -and "$($_.DriverName)" -eq $driver }).Count
+    $recrearPuerto = $false
+    if ($infoPuerto -and "$($infoPuerto.PrinterHostAddress)" -and $otrasPuerto -eq 0 -and "$($infoPuerto.Protocol)" -notmatch '^(LPR|2)$') { $recrearPuerto = $true }
+
+    Write-Host ''
+    Write-Host ("    Impresora: {0}" -f $nombre) -ForegroundColor White
+    Write-Host ("    Driver:    {0}" -f $driver)
+    Write-Host ("    Puerto:    {0}" -f $puerto)
+    if ($esConexion) { Write-Host '    Es una impresora compartida por otro equipo: se quita y se vuelve a conectar.' -ForegroundColor DarkGray }
+    elseif ($recrearPuerto) { Write-Host ("    Puerto TCP/IP hacia {0}: se borra y se crea de nuevo." -f $infoPuerto.PrinterHostAddress) -ForegroundColor DarkGray }
+    else { Write-Host '    El puerto se conserva (USB, WSD o usado por otra impresora). Si es USB, desconecte y vuelva a conectar el cable.' -ForegroundColor DarkGray }
+    if (-not (Confirmar ("¿Quitar y volver a agregar '{0}'?" -f $nombre))) { Write-Log 'Cancelado por el usuario.' 'INFO'; return $false }
+
+    $reinstalarDriver = $false
+    if (-not $esConexion -and $otrasDriver -eq 0) {
+        $reinstalarDriver = Confirmar '¿Reinstalar también el driver? Se quita y se vuelve a registrar desde el almacén de drivers de Windows. Si el paquete no está en el equipo, tendrá que instalar el del fabricante.'
+    }
+
+    try { Remove-Printer -Name $nombre -ErrorAction Stop; Write-Log ("Impresora '{0}' quitada." -f $nombre) 'OK' }
+    catch { Write-Log ("No se pudo quitar la impresora: {0}" -f $_.Exception.Message) 'ERROR'; return $false }
+
+    if ($esConexion) {
+        try { Add-Printer -ConnectionName $nombre -ErrorAction Stop; Write-Log ("Impresora '{0}' conectada de nuevo." -f $nombre) 'OK'; return $true }
+        catch {
+            Write-Log ("No se pudo volver a conectar '{0}': {1}" -f $nombre, $_.Exception.Message) 'ERROR'
+            Write-Log 'Si el error es 0x0000011b o 0x00000709, use "Impresora: error 0x0000011b / 0x00000709 al conectar".' 'INFO'
+            return $false
+        }
+    }
+
+    if ($recrearPuerto) {
+        try {
+            Remove-PrinterPort -Name $puerto -ErrorAction Stop
+            $pp = @{ Name = $puerto; PrinterHostAddress = "$($infoPuerto.PrinterHostAddress)"; ErrorAction = 'Stop' }
+            if ($infoPuerto.PortNumber) { $pp.PortNumber = [int]$infoPuerto.PortNumber }
+            if ($infoPuerto.SNMPEnabled) { $pp.SNMP = [int]$infoPuerto.SNMPIndex; $pp.SNMPCommunity = "$($infoPuerto.SNMPCommunity)" }
+            Add-PrinterPort @pp
+            Write-Log ("Puerto '{0}' recreado ({1})." -f $puerto, $infoPuerto.PrinterHostAddress) 'OK'
+        }
+        catch { Write-Log ("No se pudo recrear el puerto '{0}': {1}" -f $puerto, $_.Exception.Message) 'ADVERTENCIA' }
+    }
+
+    if ($reinstalarDriver) {
+        try {
+            Remove-PrinterDriver -Name $driver -ErrorAction Stop
+            Add-PrinterDriver -Name $driver -ErrorAction Stop
+            Write-Log ("Driver '{0}' reinstalado." -f $driver) 'OK'
+        }
+        catch {
+            Write-Log ("No se pudo reinstalar el driver '{0}': {1}" -f $driver, $_.Exception.Message) 'ERROR'
+            Write-Log ("La impresora '{0}' quedó QUITADA. Instale el driver del fabricante y agréguela con el puerto {1}." -f $nombre, $puerto) 'ADVERTENCIA'
+            return $false
+        }
+    }
+
+    try {
+        $ap = @{ Name = $nombre; DriverName = $driver; PortName = $puerto; ErrorAction = 'Stop' }
+        if ($p.Shared) { $ap.Shared = $true; $ap.ShareName = "$($p.ShareName)" }
+        if ("$($p.Location)") { $ap.Location = "$($p.Location)" }
+        if ("$($p.Comment)") { $ap.Comment = "$($p.Comment)" }
+        Add-Printer @ap
+        Write-Log ("Impresora '{0}' agregada de nuevo (driver {1}, puerto {2})." -f $nombre, $driver, $puerto) 'OK'
+        Write-Log 'Si era la predeterminada, vuelva a marcarla: la predeterminada es de cada usuario.' 'INFO'
+        return $true
+    }
+    catch {
+        Write-Log ("No se pudo agregar de nuevo '{0}': {1}" -f $nombre, $_.Exception.Message) 'ERROR'
+        Write-Log ("Agréguela a mano con: driver '{0}' y puerto '{1}'." -f $driver, $puerto) 'ADVERTENCIA'
+        return $false
+    }
+}
+
+# ---------- Windows Update a fondo ----------
+
+function Reparar-WindowsUpdateProfundo {
+    Mostrar-Titulo 'WINDOWS UPDATE: REPARACIÓN A FONDO'
+    Write-Host '    Para cuando "Reparar Windows Update" no basta (error 0x80070002, 0x8024xxxx, se queda en 0%, no busca, etc.).' -ForegroundColor Cyan
+    Write-Host '    Hace, en orden:' -ForegroundColor White
+    Write-Host '      1. Rehabilita los servicios de actualización si estaban deshabilitados.'
+    Write-Host '      2. Detiene los servicios y limpia la cola de BITS y la caché de Optimización de entrega.'
+    Write-Host '      3. Vuelve a registrar los componentes de Windows Update.'
+    Write-Host '      4. Renombra SoftwareDistribution y catroot2 (reparación normal).'
+    Write-Host '      5. Revisa políticas que bloquean las actualizaciones (y las quita si usted acepta).'
+    Write-Host '      6. Revisa el proxy de WinHTTP.'
+    Write-Host '      7. Revisa actualizaciones pendientes sin terminar.'
+    Write-Host '      8. Opcional: DISM + SFC.'
+    Write-Host '    No borra archivos personales ni programas. Se pierde el historial de actualizaciones.' -ForegroundColor DarkGray
+    if (-not (Confirmar '¿Continuar con la reparación a fondo de Windows Update?')) {
+        Write-Log 'Reparación a fondo cancelada por el usuario.' 'INFO'
+        return $false
+    }
+    $ok = $true
+
+    Write-Log '1/8 Revisando que los servicios no estén deshabilitados...' 'INFO'
+    foreach ($par in @(@('wuauserv', 'Manual'), @('bits', 'Manual'), @('cryptsvc', 'Automatic'), @('UsoSvc', 'Manual'), @('TrustedInstaller', 'Manual'))) {
+        $s = Get-Service -Name $par[0] -ErrorAction SilentlyContinue
+        if ($s -and "$($s.StartType)" -eq 'Disabled') {
+            try { Set-Service -Name $par[0] -StartupType $par[1] -ErrorAction Stop; Write-Log ("El servicio {0} estaba deshabilitado: ahora es {1}." -f $par[0], $par[1]) 'OK' }
+            catch { Write-Log ("No se pudo habilitar el servicio {0}: {1}" -f $par[0], $_.Exception.Message) 'ADVERTENCIA'; $ok = $false }
+        }
+    }
+
+    Write-Log '2/8 Deteniendo servicios y limpiando BITS y la caché de entrega...' 'INFO'
+    foreach ($s in @('wuauserv', 'bits', 'cryptsvc', 'msiserver', 'UsoSvc', 'DoSvc')) { $null = Detener-Servicio $s }
+    $qmgr = Join-Path $env:ALLUSERSPROFILE 'Microsoft\Network\Downloader'
+    $archivos = @(Get-ChildItem -LiteralPath $qmgr -Filter 'qmgr*.dat' -Force -ErrorAction SilentlyContinue)
+    foreach ($a in $archivos) { Remove-Item -LiteralPath $a.FullName -Force -ErrorAction SilentlyContinue }
+    Write-Log ("Cola de BITS: {0} archivo(s) borrados (se regeneran solos)." -f $archivos.Count) 'INFO'
+    $cacheEntrega = Join-Path $env:windir 'ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache'
+    $mb = [math]::Round((Get-TamanoCarpeta $cacheEntrega) / 1MB)
+    Limpiar-Carpeta $cacheEntrega
+    Write-Log ("Caché de Optimización de entrega: {0} MB limpiados." -f $mb) 'INFO'
+
+    Write-Log '3/8 Registrando de nuevo los componentes de Windows Update...' 'INFO'
+    $regsvr = Get-RutaSistema 'regsvr32.exe'
+    $dlls = @('atl.dll', 'urlmon.dll', 'msxml3.dll', 'msxml6.dll', 'actxprxy.dll', 'softpub.dll', 'wintrust.dll', 'initpki.dll', 'dssenh.dll', 'rsaenh.dll', 'cryptdlg.dll',
+        'wuapi.dll', 'wuaueng.dll', 'wuaueng1.dll', 'wucltui.dll', 'wucltux.dll', 'wups.dll', 'wups2.dll', 'wuweb.dll', 'wuwebv.dll', 'muweb.dll', 'qmgr.dll', 'qmgrprxy.dll')
+    $registrados = 0
+    $sinRegistro = 0
+    foreach ($dll in $dlls) {
+        $ruta = Get-RutaSistema $dll
+        if (-not [System.IO.Path]::IsPathRooted($ruta) -or -not (Test-Path -LiteralPath $ruta)) { continue }
+        try {
+            $proc = Start-Process -FilePath $regsvr -ArgumentList ('/s "{0}"' -f $ruta) -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+            if ($proc.ExitCode -eq 0) { $registrados++ } else { $sinRegistro++ }
+        }
+        catch { $sinRegistro++ }
+    }
+    Write-Log ("Componentes registrados: {0}. Sin registro propio (normal en Windows reciente): {1}." -f $registrados, $sinRegistro) 'INFO'
+
+    Write-Log '4/8 Renombrando SoftwareDistribution y catroot2...' 'INFO'
+    $r = @(Reparar-WindowsUpdate -SinConfirmar)
+    if (-not [bool]$r[-1]) { $ok = $false }
+
+    Write-Log '5/8 Revisando políticas que bloquean Windows Update...' 'INFO'
+    $clavePol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $politicas = New-Object System.Collections.Generic.List[string]
+    foreach ($ruta in @($clavePol, "$clavePol\AU")) {
+        $k = Get-Item -Path $ruta -ErrorAction SilentlyContinue
+        if ($k) { foreach ($n in @($k.GetValueNames() | Where-Object { $_ })) { $politicas.Add(("{0} = {1}" -f $n, $k.GetValue($n))) } }
+    }
+    if ($politicas.Count -eq 0) {
+        Write-Log 'No hay políticas de Windows Update configuradas.' 'OK'
+    }
+    else {
+        Write-Log ("Políticas de Windows Update encontradas: {0}" -f ($politicas -join '; ')) 'ADVERTENCIA'
+        $enDominio = $false
+        try { $enDominio = [bool](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).PartOfDomain } catch { }
+        if ($enDominio) {
+            Write-Log 'El equipo está en un dominio: las políticas las define la empresa y no se tocan.' 'INFO'
+        }
+        elseif (Confirmar ("Estas políticas pueden impedir las actualizaciones:`n`n{0}`n`n¿Quitarlas? Se respaldan en la carpeta Reportes. Si el equipo lo administra la empresa (Intune), pueden volver." -f ($politicas -join "`n"))) {
+            if (-not (Test-Path -LiteralPath $Script:DirReportes)) { New-Item -ItemType Directory -Path $Script:DirReportes -Force | Out-Null }
+            $respaldo = Join-Path $Script:DirReportes ('WindowsUpdate_politicas_{0}.reg' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+            $c = Invoke-Nativo -Archivo (Get-RutaSistema 'reg.exe') -Argumentos ('export "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" "{0}" /y' -f $respaldo) -Descripcion 'Respaldo de las políticas de Windows Update'
+            if ($c -eq 0 -and (Test-Path -LiteralPath $respaldo)) {
+                try { Remove-Item -Path $clavePol -Recurse -Force -ErrorAction Stop; Write-Log ("Políticas quitadas. Respaldo: {0}" -f $respaldo) 'OK' }
+                catch { Write-Log ("No se pudieron quitar las políticas: {0}" -f $_.Exception.Message) 'ERROR'; $ok = $false }
+            }
+            else {
+                Write-Log 'No se pudo respaldar las políticas; no se quitó nada.' 'ERROR'
+                $ok = $false
+            }
+        }
+    }
+
+    Write-Log '6/8 Revisando el proxy de WinHTTP...' 'INFO'
+    $netsh = Get-RutaSistema 'netsh.exe'
+    $proxy = ''
+    try { $proxy = (& $netsh winhttp show proxy | Out-String) } catch { }
+    if ($proxy -and $proxy -notmatch 'Direct access|Acceso directo') {
+        Write-Log ("WinHTTP tiene un proxy configurado: {0}" -f (($proxy -replace '\s+', ' ').Trim())) 'ADVERTENCIA'
+        if (Confirmar '¿Quitar el proxy de WinHTTP? Un proxy mal puesto impide las actualizaciones. Si es el proxy de la empresa, déjelo.') {
+            $null = Invoke-Nativo -Archivo $netsh -Argumentos 'winhttp reset proxy' -Descripcion 'Quitar el proxy de WinHTTP'
+        }
+    }
+    else {
+        Write-Log 'Sin proxy en WinHTTP.' 'OK'
+    }
+
+    Write-Log '7/8 Revisando actualizaciones pendientes sin terminar...' 'INFO'
+    $pendiente = Test-Path -LiteralPath (Join-Path $env:windir 'WinSxS\pending.xml')
+    $rebootCbs = Test-Path -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+    if ($pendiente -or $rebootCbs) {
+        Write-Log 'Hay una actualización pendiente que no terminó. Reinicie el equipo y vuelva a buscar actualizaciones; si el error vuelve, ejecute DISM + SFC.' 'ADVERTENCIA'
+    }
+    else {
+        Write-Log 'No hay actualizaciones pendientes sin terminar.' 'OK'
+    }
+
+    Write-Log '8/8 Archivos del sistema (opcional)...' 'INFO'
+    if (Confirmar '¿Ejecutar también DISM + SFC? Repara los archivos de Windows que usa Windows Update. Tarda de 10 a 30 minutos y necesita internet.') {
+        $r = @(Reparar-ArchivosSistema)
+        if (-not [bool]$r[-1]) { $ok = $false }
+    }
+
+    try {
+        Start-Process -FilePath (Get-RutaSistema 'UsoClient.exe') -ArgumentList 'StartScan' -WindowStyle Hidden -ErrorAction Stop
+        Write-Log 'Se pidió a Windows que busque actualizaciones.' 'INFO'
+    }
+    catch { }
+    $Script:RequiereReinicio = $true
+    if ($ok) { Write-Log 'Reparación a fondo terminada. Reinicie el equipo y busque actualizaciones en Configuración.' 'OK' }
+    else { Write-Log 'La reparación a fondo terminó con avisos (vea el registro). Reinicie y vuelva a probar.' 'ADVERTENCIA' }
+    return $ok
+}
+
+# ---------- Perfil de usuario ----------
+
+function Get-NombreUsuarioDeSid {
+    param([string]$Sid)
+    try { return (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value }
+    catch { return '' }
+}
+
+function Reparar-PerfilUsuario {
+    Mostrar-Titulo 'REPARAR PERFIL DE USUARIO (TEMPORAL O DAÑADO)'
+    Write-Host '    Cuando el usuario inicia sesión y ve un escritorio vacío o el aviso "No se pudo cargar su perfil" (perfil TEMP).' -ForegroundColor Cyan
+    Write-Host '    Windows deja la clave real del perfil con el sufijo .bak en el registro. Aquí se restaura (sin tocar sus archivos).' -ForegroundColor DarkGray
+    $lista = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+    $porSid = @{}
+    foreach ($k in @(Get-ChildItem -Path $lista -ErrorAction SilentlyContinue)) {
+        $n = "$($k.PSChildName)"
+        if ($n -match '^(S-1-5-21-[\d-]+?)(\.bak)?$') {
+            $sid = $Matches[1]
+            if (-not $porSid.ContainsKey($sid)) { $porSid[$sid] = @{ Normal = $null; Bak = $null } }
+            if ($Matches[2]) { $porSid[$sid].Bak = $k } else { $porSid[$sid].Normal = $k }
+        }
+    }
+    $raizUsuarios = Join-Path $env:SystemDrive 'Users'
+    $plan = New-Object System.Collections.Generic.List[object]
+    foreach ($sid in $porSid.Keys) {
+        $par = $porSid[$sid]
+        $usuario = Get-NombreUsuarioDeSid $sid
+        if (-not $usuario) { $usuario = $sid }
+        $rutaNormal = ''
+        if ($par.Normal) { $rutaNormal = "$($par.Normal.GetValue('ProfileImagePath'))" }
+        if ($par.Bak) {
+            $carpeta = "$($par.Bak.GetValue('ProfileImagePath'))"
+            if (-not $carpeta -or $carpeta -match '\\TEMP(\.|$)' -or -not (Test-Path -LiteralPath $carpeta)) {
+                Write-Log ("{0}: la clave .bak apunta a una carpeta que no existe o es temporal ({1}); no se puede restaurar sola." -f $usuario, $carpeta) 'ADVERTENCIA'
+                continue
+            }
+            if ($par.Normal -and $rutaNormal -notmatch '\\TEMP(\.|$)' -and $rutaNormal -ne $carpeta) {
+                Write-Log ("{0}: hay dos perfiles registrados con carpetas distintas ({1} y {2}); corríjalo a mano en el registro." -f $usuario, $rutaNormal, $carpeta) 'ADVERTENCIA'
+                continue
+            }
+            $plan.Add([pscustomobject]@{ Tipo = 'Bak'; Sid = $sid; Usuario = $usuario; Carpeta = $carpeta; TieneNormal = [bool]$par.Normal; Texto = ("{0}: restaurar la clave .bak (carpeta {1})" -f $usuario, $carpeta) })
+        }
+        elseif ($par.Normal -and $rutaNormal -match '\\TEMP(\.|$)') {
+            $corto = ($usuario -split '\\')[-1]
+            $candidatas = @(Get-ChildItem -LiteralPath $raizUsuarios -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $corto -or $_.Name -like "$corto.*" })
+            if ($candidatas.Count -eq 1) {
+                $plan.Add([pscustomobject]@{ Tipo = 'Repuntar'; Sid = $sid; Usuario = $usuario; Carpeta = $candidatas[0].FullName; TieneNormal = $true; Texto = ("{0}: usa un perfil temporal y no hay copia .bak; apuntarlo a {1}" -f $usuario, $candidatas[0].FullName) })
+            }
+            else {
+                Write-Log ("{0}: usa un perfil temporal, no hay copia .bak y no se pudo identificar su carpeta en {1} ({2} candidata(s)). Cree un usuario nuevo y copie los datos." -f $usuario, $raizUsuarios, $candidatas.Count) 'ADVERTENCIA'
+            }
+        }
+    }
+
+    if ($plan.Count -eq 0) {
+        Write-Log 'No se encontraron perfiles dañados (.bak) ni temporales que se puedan reparar solos.' 'INFO'
+        $activo = Get-PerfilUsuarioActivo
+        if ("$($activo.Ruta)" -match '\\TEMP(\.|$)') { Write-Log 'Aun así, el usuario de la sesión usa un perfil TEMP: revise los avisos de arriba.' 'ADVERTENCIA' }
+        return $true
+    }
+
+    $texto = "Se repararán estos perfiles:`n`n" + (($plan | ForEach-Object { '- ' + $_.Texto }) -join "`n") + "`n`nSe respalda el registro antes. No se borra ningún archivo del usuario. Después el usuario debe cerrar sesión o reiniciar el equipo. ¿Continuar?"
+    if (-not (Confirmar $texto)) { Write-Log 'Reparación de perfil cancelada por el usuario.' 'INFO'; return $false }
+
+    if (-not (Test-Path -LiteralPath $Script:DirReportes)) { New-Item -ItemType Directory -Path $Script:DirReportes -Force | Out-Null }
+    $respaldo = Join-Path $Script:DirReportes ('ProfileList_{0}.reg' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $c = Invoke-Nativo -Archivo (Get-RutaSistema 'reg.exe') -Argumentos ('export "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList" "{0}" /y' -f $respaldo) -Descripcion 'Respaldo de la lista de perfiles'
+    if ($c -ne 0 -or -not (Test-Path -LiteralPath $respaldo)) {
+        Write-Log 'No se pudo respaldar el registro; no se cambió nada.' 'ERROR'
+        return $false
+    }
+    Write-Log ("Respaldo del registro: {0}" -f $respaldo) 'INFO'
+
+    $ok = $true
+    $activo = Get-PerfilUsuarioActivo
+    foreach ($e in $plan) {
+        $normal = "$lista\$($e.Sid)"
+        $bak = "$normal.bak"
+        try {
+            if ($e.Tipo -eq 'Bak') {
+                if (Test-Path -LiteralPath $normal) { Remove-Item -LiteralPath $normal -Recurse -Force -ErrorAction Stop }
+                Rename-Item -LiteralPath $bak -NewName $e.Sid -ErrorAction Stop
+            }
+            else {
+                Set-ItemProperty -LiteralPath $normal -Name 'ProfileImagePath' -Value $e.Carpeta -Type ExpandString -ErrorAction Stop
+            }
+            Set-ItemProperty -LiteralPath $normal -Name 'RefCount' -Value 0 -Type DWord -ErrorAction Stop
+            Set-ItemProperty -LiteralPath $normal -Name 'State' -Value 0 -Type DWord -ErrorAction Stop
+            Write-Log ("Perfil de {0} reparado (carpeta {1})." -f $e.Usuario, $e.Carpeta) 'OK'
+            if ($e.Sid -eq "$($activo.SID)") { Write-Log 'Es el usuario de la sesión actual: debe cerrar sesión o reiniciar para que se aplique.' 'ADVERTENCIA' }
+        }
+        catch {
+            Write-Log ("No se pudo reparar el perfil de {0}: {1}" -f $e.Usuario, $_.Exception.Message) 'ERROR'
+            $ok = $false
+        }
+    }
+    if ($ok) { Write-Log ("Listo. Si algo sale mal, el respaldo está en {0} (doble clic para restaurarlo)." -f $respaldo) 'OK' }
+    $Script:RequiereReinicio = $true
+    return $ok
+}
+
+#endregion
+
 #region ==================== CATÁLOGO DE ACCIONES ====================
 
 # Lista única de acciones: la usan la interfaz gráfica (tarjetas por categoría) y el submenú de consola.
 $Script:Catalogo = @(
     @{ Cat = 'Sistema'; Titulo = 'Reparar archivos de Windows'; Desc = 'DISM + SFC. Repara archivos dañados del sistema (10-30 min, necesita internet).'; Cmd = 'Reparar-ArchivosSistema' }
     @{ Cat = 'Sistema'; Titulo = 'Reparar Windows Update'; Desc = 'Cuando las actualizaciones fallan o se quedan pegadas.'; Cmd = 'Reparar-WindowsUpdate' }
+    @{ Cat = 'Sistema'; Titulo = 'Windows Update a fondo'; Desc = 'Cuando la reparación normal no basta: servicios, BITS, componentes, caché de entrega, políticas, proxy y DISM opcional.'; Aviso = 'Tarda unos minutos; pide reiniciar'; Cmd = 'Reparar-WindowsUpdateProfundo'; Avanzada = $true }
+    @{ Cat = 'Sistema'; Titulo = 'Reparar perfil de usuario'; Desc = 'Perfil temporal (TEMP) o dañado (clave .bak): lo restaura sin tocar los archivos del usuario.'; Aviso = 'Respalda el registro; el usuario debe reiniciar'; Cmd = 'Reparar-PerfilUsuario'; Avanzada = $true }
     @{ Cat = 'Sistema'; Titulo = 'Desinstalar una actualización'; Desc = 'Quita una actualización reciente si algo dejó de funcionar después de instalarla.'; Cmd = 'Desinstalar-Actualizacion'; Avanzada = $true }
     @{ Cat = 'Sistema'; Titulo = 'Limpiar archivos temporales'; Desc = 'Temporales, caché de Windows Update y, opcionalmente, la papelera.'; Cmd = 'Limpiar-Temporales' }
     @{ Cat = 'Sistema'; Titulo = 'Revisar disco (CHKDSK)'; Desc = 'Escaneo en línea y CHKDSK al reiniciar si encuentra errores.'; Cmd = 'Revisar-Disco' }
@@ -4892,6 +5353,10 @@ $Script:Catalogo = @(
     @{ Cat = 'Sonido y dispositivos'; Titulo = 'Micrófono y cámara'; Desc = 'Permisos de privacidad, silencio y dispositivos deshabilitados.'; Cmd = 'Reparar-MicrofonoCamara'; Avanzada = $true }
     @{ Cat = 'Sonido y dispositivos'; Titulo = 'Bluetooth y USB'; Desc = 'Reinicia Bluetooth y evita que Windows apague el USB para ahorrar energía.'; Cmd = 'Reparar-BluetoothUsb'; Avanzada = $true }
     @{ Cat = 'Sonido y dispositivos'; Titulo = 'Impresora'; Desc = 'Vacía la cola atascada y vuelve a poner la impresora en línea.'; Cmd = 'Reparar-Impresora' }
+    @{ Cat = 'Sonido y dispositivos'; Titulo = 'Reinstalar impresora (puerto y driver)'; Desc = 'La quita y la vuelve a agregar con el mismo driver y puerto; opcionalmente reinstala el driver.'; Cmd = 'Reinstalar-Impresora'; Avanzada = $true }
+    @{ Cat = 'Sonido y dispositivos'; Titulo = 'Impresora: error 0x0000011b / 0x00000709 al conectar'; Desc = 'Impresora compartida en red que falla tras una actualización de Windows.'; Aviso = 'Baja un poco la seguridad; reversible'; Cmd = 'Reparar-ImpresoraRpc'; Avanzada = $true }
+    @{ Cat = 'Sonido y dispositivos'; Titulo = 'Impresora: error 0x00000709 al fijar la predeterminada'; Desc = 'Windows no deja elegir la impresora predeterminada.'; Cmd = 'Reparar-ImpresoraPredeterminada'; Avanzada = $true }
+    @{ Cat = 'Sonido y dispositivos'; Titulo = 'Impresora: error 0x00000bcb / 0x0000007c (driver bloqueado)'; Desc = 'Un usuario normal no puede instalar el driver de una impresora compartida.'; Aviso = 'Menos seguro; reversible'; Cmd = 'Reparar-ImpresoraDriverBloqueado'; Avanzada = $true }
     @{ Cat = 'Sonido y dispositivos'; Titulo = 'Reporte de batería'; Desc = 'Desgaste y uso de la batería (laptops).'; Cmd = 'Get-ReporteBateria' }
 
     @{ Cat = 'Outlook y Office'; Titulo = 'Reparación rápida de Outlook'; Desc = 'Cierra Outlook y limpia caché, temporales de adjuntos y libreta sin conexión.'; Cmd = 'Limpiar-CacheOutlook' }

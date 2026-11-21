@@ -149,12 +149,24 @@ Los programas del usuario (Outlook, el Panel de sonido, el reporte HTML, el Expl
 
 ## Contraseña
 
+**Forma recomendada: archivo `.env`.**
+
+1. Copie `.env.example` como `.env` en la raíz del proyecto y escriba su contraseña: `SOPORTE_CLAVE=su_contraseña` (mínimo 6 caracteres).
+2. Compile con `build\Compilar.ps1`. Los dos `.exe` salen con esa contraseña.
+
+- El `.env` está en `.gitignore`: **no se sube a git**.
+- `src\SoporteTecnico.ps1` no se modifica. La contraseña se aplica en copias temporales que se borran al terminar.
+- Para cambiarla, edite el `.env` y vuelva a compilar. Para quitarla, déjela vacía o borre el `.env`.
+- Solo aplica a los `.exe`. `Ejecutar.bat` y `Ejecutar-Consola.bat` lanzan el `.ps1` y no piden contraseña.
+- El `.env` guarda la contraseña en texto: no lo copie a la USB que lleva a los clientes. Allí solo va el `.exe`.
+
+**Forma alternativa** (modifica `src\SoporteTecnico.ps1`, así que no suba ese cambio a un repo público):
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File build\CambiarContrasena.ps1
 ```
 
-1. Escriba la contraseña dos veces (mínimo 6 caracteres). Déjela vacía para quitarla.
-2. Vuelva a compilar. La contraseña aplica a las dos versiones.
+Escriba la contraseña dos veces (mínimo 6 caracteres; vacía para quitarla) y vuelva a compilar. Si hay un `.env` con contraseña, tiene prioridad al compilar.
 
 Funciona así:
 - Se guarda solo un hash con sal (PBKDF2), nunca la contraseña.
@@ -203,7 +215,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build\Compilar.ps1
 
 1. Valida la sintaxis con el parser de PowerShell 5.1. Si encuentra errores, no compila.
 2. Verifica que el script esté en UTF-8 con BOM.
-3. Avisa si no hay contraseña configurada.
+3. Lee la contraseña del `.env` (si existe) y la pone, solo como hash, en copias temporales. Avisa si no hay contraseña configurada.
 4. Instala `ps2exe` si falta.
 5. Genera `SoporteTecnico.exe` (gráfico) y `SoporteTecnico-Consola.exe`, ambos de 64 bits y con permisos de administrador.
 

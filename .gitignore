@@ -1,6 +1,11 @@
 # Ejecutables compilados: se publican en Releases, no en el código
 *.exe
 
+# Contraseña de la herramienta (build\Compilar.ps1 la lee de aquí). NUNCA se sube a git.
+.env
+.env.*
+!.env.example
+
 # Archivos temporales y de sistema
 *.tmp
 *.bak
