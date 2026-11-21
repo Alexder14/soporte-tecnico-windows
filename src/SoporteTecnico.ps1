@@ -4042,6 +4042,7 @@ function Aplicar-InicioGui {
 function Mostrar-InicioGui {
     [xml]$x = $Script:XamlInicio
     $w = [System.Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
+    Add-EstilosOscuros $w
     $Script:InicioGui = @{ Ventana = $w }
     foreach ($n in @('TxtResumen', 'TxtArranque', 'Lista', 'TxtMensaje', 'BtnDesactivar', 'BtnActivar', 'BtnCerrar')) { $Script:InicioGui[$n] = $w.FindName($n) }
     try {
@@ -6254,8 +6255,17 @@ function Elegir-Varias {
     $sugerido = (@($Predeterminadas) | ForEach-Object { $_ + 1 }) -join ','
     $ayuda = 'Escriba los números separados por comas (por ejemplo 1,3,5-7) o "todos".'
     if ($Script:ModoInterfaz -eq 'Grafica') {
-        $resp = Solicitar-Gui -Tipo 'Texto' -Texto (($lineas -join "`n") + "`n`n" + $Pregunta + "`n" + $ayuda) -Valor $sugerido
-        if ($Sync.Cancelado) { return $null }
+        # En la ventana: lista con casillas (lo recomendado ya viene marcado), sin escribir números ni rangos.
+        $ayudaGui = 'Marque lo que quiera y pulse Aceptar.'
+        if (@($Predeterminadas).Count -gt 0) { $ayudaGui += ' Lo recomendado viene marcado y en verde.' }
+        $respGui = Solicitar-Gui -Tipo 'Lista' -Texto $ayudaGui -Extra @{ Opciones = $Opciones; Multi = $true; Marcadas = @($Predeterminadas); Titulo = $Pregunta }
+        if (-not "$respGui".Trim()) { return $null }
+        $marcados = New-Object System.Collections.Generic.List[int]
+        foreach ($parte in ("$respGui" -split ',')) {
+            $k = 0
+            if ([int]::TryParse($parte.Trim(), [ref]$k) -and $k -ge 0 -and $k -lt $Opciones.Count -and -not $marcados.Contains($k)) { $marcados.Add($k) }
+        }
+        return @($marcados | Sort-Object)
     }
     else {
         foreach ($l in $lineas) { Write-Host ("    {0}" -f $l) }
@@ -7660,6 +7670,7 @@ function Mostrar-DialogoGui {
     if ($tipo -eq 'Lista') { return (Mostrar-ListaGui $Pregunta) }
     [xml]$x = $Script:XamlDialogo
     $dlg = [System.Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
+    Add-EstilosOscuros $dlg
     $titulo = $dlg.FindName('Titulo')
     $mensaje = $dlg.FindName('Mensaje')
     $entrada = $dlg.FindName('Entrada')
@@ -7680,6 +7691,7 @@ function Mostrar-DialogoGui {
         }
         'Texto' {
             $titulo.Text = 'Ingresar dato'
+            if ($Pregunta.Titulo) { $titulo.Text = "$($Pregunta.Titulo)" }
             $entrada.Visibility = [System.Windows.Visibility]::Visible
             $btnSi.Content = 'Aceptar'
             $btnNo.Content = 'Cancelar'
@@ -7706,7 +7718,10 @@ function Mostrar-DialogoGui {
             $w.Close()
         })
     $dlg.Add_MouseLeftButtonDown({ try { $this.DragMove() } catch { } })
-    if ($tipo -eq 'Texto') { $dlg.Add_ContentRendered({ [void]$this.FindName('Entrada').Focus() }) }
+    if ($tipo -eq 'Texto') {
+        # Con un valor ya escrito (por ejemplo el cliente anterior) queda seleccionado: se acepta tal cual o se sobrescribe
+        $dlg.Add_ContentRendered({ $caja = $this.FindName('Entrada'); [void]$caja.Focus(); $caja.SelectAll() })
+    }
     try { if ($Script:Gui.Ventana.IsLoaded) { $dlg.Owner = $Script:Gui.Ventana } } catch { }
     [void]$dlg.ShowDialog()
     $r = "$($dlg.Tag)"
@@ -7924,12 +7939,134 @@ $Script:XamlLista = @'
 </Window>
 '@
 
+# Estilo oscuro común (barras de desplazamiento, casillas y botones de selección). Sin esto WPF usa los
+# controles claros de Windows: barra blanca y casillas blancas sobre el fondo oscuro.
+$Script:XamlEstilos = @'
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <ControlTemplate x:Key="BotonScrollVacio" TargetType="RepeatButton">
+    <Border Background="Transparent"/>
+  </ControlTemplate>
+  <Style x:Key="PulgarScroll" TargetType="Thumb">
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="Thumb">
+          <Border x:Name="Pulgar" CornerRadius="4" Background="#334155" Margin="1"/>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Pulgar" Property="Background" Value="#64748B"/></Trigger>
+            <Trigger Property="IsDragging" Value="True"><Setter TargetName="Pulgar" Property="Background" Value="#94A3B8"/></Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+  <Style TargetType="ScrollBar">
+    <Setter Property="Background" Value="Transparent"/>
+    <Setter Property="Width" Value="12"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="ScrollBar">
+          <Grid Background="Transparent">
+            <Track x:Name="PART_Track" IsDirectionReversed="True">
+              <Track.DecreaseRepeatButton><RepeatButton Command="ScrollBar.PageUpCommand" Template="{StaticResource BotonScrollVacio}"/></Track.DecreaseRepeatButton>
+              <Track.IncreaseRepeatButton><RepeatButton Command="ScrollBar.PageDownCommand" Template="{StaticResource BotonScrollVacio}"/></Track.IncreaseRepeatButton>
+              <Track.Thumb><Thumb Style="{StaticResource PulgarScroll}"/></Track.Thumb>
+            </Track>
+          </Grid>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+    <Style.Triggers>
+      <Trigger Property="Orientation" Value="Horizontal">
+        <Setter Property="Width" Value="Auto"/>
+        <Setter Property="Height" Value="12"/>
+        <Setter Property="Template">
+          <Setter.Value>
+            <ControlTemplate TargetType="ScrollBar">
+              <Grid Background="Transparent">
+                <Track x:Name="PART_Track" IsDirectionReversed="False">
+                  <Track.DecreaseRepeatButton><RepeatButton Command="ScrollBar.PageLeftCommand" Template="{StaticResource BotonScrollVacio}"/></Track.DecreaseRepeatButton>
+                  <Track.IncreaseRepeatButton><RepeatButton Command="ScrollBar.PageRightCommand" Template="{StaticResource BotonScrollVacio}"/></Track.IncreaseRepeatButton>
+                  <Track.Thumb><Thumb Style="{StaticResource PulgarScroll}"/></Track.Thumb>
+                </Track>
+              </Grid>
+            </ControlTemplate>
+          </Setter.Value>
+        </Setter>
+      </Trigger>
+    </Style.Triggers>
+  </Style>
+  <Style TargetType="CheckBox">
+    <Setter Property="Foreground" Value="#E2E8F0"/>
+    <Setter Property="Cursor" Value="Hand"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="CheckBox">
+          <Grid Background="Transparent">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+            <Border x:Name="Caja" Width="18" Height="18" CornerRadius="4" Background="#0B1120" BorderBrush="#64748B" BorderThickness="1.5" VerticalAlignment="Top" Margin="0,1,0,0">
+              <Path x:Name="Marca" Data="M 3.5,8.5 L 7,12 L 13.5,4.5" Stroke="#FFFFFF" StrokeThickness="2" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Visibility="Collapsed"/>
+            </Border>
+            <ContentPresenter Grid.Column="1" VerticalAlignment="Center" Margin="2,0,0,0"/>
+          </Grid>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsChecked" Value="True">
+              <Setter TargetName="Caja" Property="Background" Value="#2563EB"/>
+              <Setter TargetName="Caja" Property="BorderBrush" Value="#2563EB"/>
+              <Setter TargetName="Marca" Property="Visibility" Value="Visible"/>
+            </Trigger>
+            <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Caja" Property="BorderBrush" Value="#60A5FA"/></Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+  <Style TargetType="RadioButton">
+    <Setter Property="Foreground" Value="#E2E8F0"/>
+    <Setter Property="Cursor" Value="Hand"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="RadioButton">
+          <Grid Background="Transparent">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+            <Border x:Name="Circulo" Width="18" Height="18" CornerRadius="9" Background="#0B1120" BorderBrush="#64748B" BorderThickness="1.5" VerticalAlignment="Top" Margin="0,1,0,0">
+              <Ellipse x:Name="Punto" Width="8" Height="8" Fill="#FFFFFF" Visibility="Collapsed"/>
+            </Border>
+            <ContentPresenter Grid.Column="1" VerticalAlignment="Center" Margin="2,0,0,0"/>
+          </Grid>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsChecked" Value="True">
+              <Setter TargetName="Circulo" Property="Background" Value="#2563EB"/>
+              <Setter TargetName="Circulo" Property="BorderBrush" Value="#2563EB"/>
+              <Setter TargetName="Punto" Property="Visibility" Value="Visible"/>
+            </Trigger>
+            <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Circulo" Property="BorderBrush" Value="#60A5FA"/></Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+</ResourceDictionary>
+'@
+
+function Add-EstilosOscuros {
+    # Agrega el estilo oscuro común a una ventana recién cargada.
+    param($Ventana)
+    try {
+        [xml]$xe = $Script:XamlEstilos
+        $dic = [System.Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xe))
+        $Ventana.Resources.MergedDictionaries.Add($dic)
+    }
+    catch { }
+}
+
 function Mostrar-ListaGui {
     # Ventana con una lista para elegir UNA opción (botones de selección) o VARIAS (casillas).
     # Devuelve los índices elegidos separados por coma ('2' o '0,3,5'), o '' si se cancela.
     param($Pregunta)
     [xml]$x = $Script:XamlLista
     $w = [System.Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $x))
+    Add-EstilosOscuros $w
     $multi = [bool]$Pregunta.Multi
     $g = @{ Ventana = $w; Multi = $multi; Resultado = '' }
     foreach ($n in @('Titulo', 'Mensaje', 'Lista', 'BtnTodos', 'BtnCancelar', 'BtnAceptar', 'TxtAviso')) { $g[$n] = $w.FindName($n) }
@@ -8290,6 +8427,7 @@ function Iniciar-InterfazGrafica {
 
     [xml]$xaml = $Script:XamlPrincipal
     $ventana = [System.Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
+    Add-EstilosOscuros $ventana
     $Script:Gui = @{
         Ventana = $ventana; Intentos = 0; DialogoAbierto = $false; CerrarSinPreguntar = $false; HayAcciones = $false; AccesoOk = $false
         BotonesNav = New-Object System.Collections.Generic.List[object]
