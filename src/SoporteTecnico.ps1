@@ -100,6 +100,7 @@ function Test-UnidadUsb {
 #   <USB>\Clientes\<NOMBRE-DEL-EQUIPO>\Logs  y  \Reportes
 # Si la USB está protegida o llena, se usa C:\SoporteTecnico como siempre.
 $carpetaPrograma = Get-CarpetaPrograma
+$Script:CarpetaPrograma = $carpetaPrograma
 if ($carpetaPrograma -and (Test-UnidadUsb $carpetaPrograma)) {
     $baseUsb = Join-Path (Join-Path $carpetaPrograma 'Clientes') $env:COMPUTERNAME
     try {
@@ -5393,6 +5394,7 @@ $Script:Catalogo = @(
     @{ Cat = 'Formatear equipo'; Titulo = '2. Respaldar todos los drivers'; Desc = 'Copia los drivers del fabricante para restaurarlos después de formatear.'; Cmd = 'Respaldar-Drivers' }
     @{ Cat = 'Formatear equipo'; Titulo = '3. Restaurar drivers desde carpeta/USB'; Desc = 'Ya formateado: instala el respaldo de drivers.'; Cmd = 'Instalar-DriversCarpeta' }
     @{ Cat = 'Formatear equipo'; Titulo = '4. Restaurar datos del cliente'; Desc = 'Copia el respaldo a las carpetas del usuario con sesión. No borra nada ni reemplaza archivos más nuevos.'; Cmd = 'Restaurar-DatosCliente'; Avanzada = $true }
+    @{ Cat = 'Formatear equipo'; Titulo = '5. Instalar programas'; Desc = 'Chrome, Adobe Reader, 7-Zip, AnyDesk, Office... con winget. La lista se edita en Programas.txt, junto al .exe.'; Cmd = 'Instalar-Programas'; Avanzada = $true }
     @{ Cat = 'Reportes'; Titulo = 'Reporte de entrega para el cliente'; Desc = 'Página para el cliente: estado del equipo antes y después, trabajos realizados y pendientes. Se imprime o se guarda como PDF.'; Cmd = 'New-ReporteEntrega'; Avanzada = $true }
     @{ Cat = 'Reportes'; Titulo = 'Reporte de atenciones'; Desc = 'Lo atendido en un período (este mes, el anterior, fechas...): visitas, clientes, equipos y trabajos más frecuentes.'; Cmd = 'New-ReporteAtenciones'; Avanzada = $true }
     @{ Cat = 'Reportes'; Titulo = 'Abrir el historial en Excel'; Desc = 'Todas las visitas (Historial.csv). Ciérrelo antes de terminar la visita.'; Cmd = 'Abrir-HistorialExcel'; Ui = $true; Avanzada = $true }
@@ -7100,6 +7102,135 @@ function Restaurar-Favoritos {
 
 #endregion
 
+#region ==================== FORMATEO: INSTALAR PROGRAMAS (WINGET) ====================
+
+function Get-ProgramasPredeterminados {
+    # Lista inicial. Se copia a Programas.txt (junto al .exe) para editarla sin recompilar.
+    # Los Id son de winget: si alguno falla, búsquelo con  winget search <nombre>  y corríjalo en Programas.txt.
+    return @(
+        'Google Chrome | Google.Chrome',
+        'Mozilla Firefox | Mozilla.Firefox',
+        'Adobe Acrobat Reader | Adobe.Acrobat.Reader.64-bit',
+        '7-Zip | 7zip.7zip',
+        'WinRAR | RARLab.WinRAR',
+        'VLC | VideoLAN.VLC',
+        'AnyDesk | AnyDeskSoftwareGmbH.AnyDesk',
+        'TeamViewer | TeamViewer.TeamViewer',
+        'Zoom | Zoom.Zoom',
+        'Microsoft Teams | Microsoft.Teams',
+        'Microsoft 365 (Office) | Microsoft.Office',
+        'LibreOffice | TheDocumentFoundation.LibreOffice',
+        'Notepad++ | Notepad++.Notepad++',
+        'Google Drive | Google.GoogleDrive',
+        'Java | Oracle.JavaRuntimeEnvironment',
+        'Visual C++ 2015-2022 (x64) | Microsoft.VCRedist.2015+.x64'
+    )
+}
+
+function Get-ListaProgramas {
+    # Lee Programas.txt (Nombre | Id winget). Si no existe y la herramienta está en la USB, lo crea.
+    $archivo = $null
+    if ($Script:CarpetaPrograma) { $archivo = Join-Path $Script:CarpetaPrograma 'Programas.txt' }
+    $lineas = @()
+    if ($archivo -and (Test-Path -LiteralPath $archivo)) {
+        $lineas = @(Get-Content -LiteralPath $archivo -Encoding UTF8 -ErrorAction SilentlyContinue)
+        Write-Log "Lista de programas: $archivo" 'INFO'
+    }
+    else {
+        $lineas = Get-ProgramasPredeterminados
+        if ($archivo -and $Script:EnUsb) {
+            try {
+                $encabezado = @(
+                    '# Programas que ofrece "Instalar programas". Una línea por programa:  Nombre | Id de winget',
+                    '# Para buscar el Id:  winget search <nombre>   (columna "Id"). Las líneas con # se ignoran.',
+                    ''
+                )
+                [System.IO.File]::WriteAllLines($archivo, [string[]]($encabezado + $lineas), (New-Object System.Text.UTF8Encoding($true)))
+                Write-Log "Se creó la lista editable de programas: $archivo" 'INFO'
+            }
+            catch { }
+        }
+    }
+    $lista = New-Object System.Collections.Generic.List[object]
+    foreach ($l in $lineas) {
+        $t = "$l".Trim()
+        if (-not $t -or $t.StartsWith('#')) { continue }
+        $partes = $t -split '\|', 2
+        if ($partes.Count -lt 2) { continue }
+        $id = $partes[1].Trim()
+        if ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9._+\-]*$') { Write-Log "Id de winget no válido en Programas.txt: $id" 'ADVERTENCIA'; continue }
+        $lista.Add([pscustomobject]@{ Nombre = $partes[0].Trim(); Id = $id })
+    }
+    return $lista.ToArray()
+}
+
+function Get-RutaWinget {
+    # Con permisos de administrador "winget" muchas veces no está en el PATH: se busca el de App Installer.
+    $c = Get-Command 'winget.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c -and $c.Source -and (Test-Path -LiteralPath $c.Source)) { return $c.Source }
+    try {
+        $instalados = @(Resolve-Path -Path (Join-Path $env:ProgramFiles 'WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe') -ErrorAction Stop |
+            Sort-Object -Property { $v = $null; $t = ($_.Path -split '_')[1]; if ([version]::TryParse($t, [ref]$v)) { $v } else { [version]'0.0' } } -Descending)
+        if ($instalados.Count -gt 0) { return $instalados[0].Path }
+    }
+    catch { }
+    $perfil = Get-PerfilUsuarioActivo
+    foreach ($r in @((Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'), (Join-Path $perfil.LocalAppData 'Microsoft\WindowsApps\winget.exe'))) {
+        if (Test-Path -LiteralPath $r) { return $r }
+    }
+    return $null
+}
+
+function Instalar-Programas {
+    Mostrar-Titulo 'INSTALAR PROGRAMAS'
+    Write-Host '    Instala programas desde el catálogo oficial de winget (descarga la última versión de cada fabricante).' -ForegroundColor DarkGray
+    $winget = Get-RutaWinget
+    if (-not $winget) {
+        Write-Log 'winget no está disponible en este equipo.' 'ERROR'
+        Write-Log 'En un Windows recién instalado puede tardar unos minutos en aparecer. Si no, actualice "Instalador de aplicación" desde Microsoft Store (se abre ahora) y vuelva a intentar.' 'INFO'
+        try { Start-ComoUsuario -Programa (Get-RutaSistema 'cmd.exe') -Argumentos '/c start ms-windows-store://pdp/?productid=9NBLGGH4NNS1' | Out-Null } catch { }
+        return $false
+    }
+    Write-Log "winget: $winget" 'INFO' -SoloArchivo
+    $programas = @(Get-ListaProgramas)
+    if ($programas.Count -eq 0) { Write-Log 'La lista de programas está vacía (Programas.txt).' 'ADVERTENCIA'; return $false }
+    $indices = Elegir-Varias -Pregunta '¿Qué programas instalar?' -Opciones @($programas | ForEach-Object { $_.Nombre })
+    if ($null -eq $indices -or @($indices).Count -eq 0) { Write-Log 'Operación cancelada.' 'INFO'; return $false }
+    $elegidos = @($indices | ForEach-Object { $programas[$_] })
+    Write-Host ("    Se van a instalar: {0}" -f (($elegidos | ForEach-Object { $_.Nombre }) -join ', ')) -ForegroundColor Cyan
+    if (-not (Confirmar '¿Instalar ahora? (necesita internet; puede tardar varios minutos)')) { return $false }
+
+    $resultados = New-Object System.Collections.Generic.List[object]
+    foreach ($p in $elegidos) {
+        # ¿Ya está instalado? (winget list termina en 0 si lo encuentra)
+        $codigoLista = Invoke-Nativo -Archivo $winget -Argumentos ('list --id {0} --exact --source winget --accept-source-agreements' -f $p.Id) -Descripcion ("Buscar {0} instalado" -f $p.Nombre)
+        if ($codigoLista -eq 0) {
+            Write-Log ("{0} ya está instalado." -f $p.Nombre) 'OK'
+            $resultados.Add([pscustomobject]@{ Nombre = $p.Nombre; Estado = 'ya estaba instalado'; Ok = $true })
+            continue
+        }
+        $codigo = Invoke-Nativo -Archivo $winget -Argumentos ('install --id {0} --exact --source winget --silent --accept-package-agreements --accept-source-agreements' -f $p.Id) -Descripcion ("Instalar {0}" -f $p.Nombre)
+        if ($codigo -eq 0) {
+            $resultados.Add([pscustomobject]@{ Nombre = $p.Nombre; Estado = 'instalado'; Ok = $true })
+        }
+        else {
+            $hex = '0x{0:X8}' -f ([int]$codigo)
+            Write-Log ("{0}: winget terminó con el código {1}. Si el Id no existe, corríjalo en Programas.txt (winget search {0})." -f $p.Nombre, $hex) 'ADVERTENCIA'
+            $resultados.Add([pscustomobject]@{ Nombre = $p.Nombre; Estado = "no se instaló ($hex)"; Ok = $false })
+        }
+    }
+    Mostrar-Titulo 'RESUMEN DE LA INSTALACIÓN'
+    foreach ($r in $resultados) {
+        if ($r.Ok) { Write-Host ("    [OK]    {0}: {1}" -f $r.Nombre, $r.Estado) -ForegroundColor Green }
+        else { Write-Host ("    [FALLÓ] {0}: {1}" -f $r.Nombre, $r.Estado) -ForegroundColor Red }
+        Write-Log ("Instalar programas: {0} -> {1}" -f $r.Nombre, $r.Estado) 'INFO' -SoloArchivo
+    }
+    Write-Log 'Algunos programas (Zoom, Teams) se instalan para el usuario que ejecuta la herramienta: si no aparecen al cliente, instálelos desde su sesión.' 'INFO'
+    return (@($resultados | Where-Object { -not $_.Ok }).Count -eq 0)
+}
+
+#endregion
+
 #region ==================== INTERFAZ GRÁFICA: DISEÑO (XAML) ====================
 
 $Script:XamlPrincipal = @'
@@ -7852,7 +7983,7 @@ function New-RunspaceGui {
         if (($Script:FuncionesIniciales -notcontains $f.Name) -or $f.Name -eq 'Clear-Host') { $funciones[$f.Name] = $f.Definition }
     }
     $variables = @{ Sync = $Sync; RequiereReinicio = $false }
-    foreach ($v in @('Version', 'Base', 'BaseLocal', 'EnUsb', 'DirLogs', 'DirReportes', 'LogFile', 'NombresAcciones', 'CodigoCoreAudio', 'ClaveIteraciones', 'ModoInterfaz', 'InfoSO', 'VendoresPci', 'VendoresUsb', 'VendoresAcpi', 'TiposPci', 'TiposUsb')) {
+    foreach ($v in @('Version', 'Base', 'BaseLocal', 'EnUsb', 'DirLogs', 'DirReportes', 'LogFile', 'NombresAcciones', 'CodigoCoreAudio', 'ClaveIteraciones', 'ModoInterfaz', 'InfoSO', 'CarpetaPrograma', 'VendoresPci', 'VendoresUsb', 'VendoresAcpi', 'TiposPci', 'TiposUsb')) {
         $variables[$v] = (Get-Variable -Name $v -Scope Script).Value
     }
     $ps = [powershell]::Create()
